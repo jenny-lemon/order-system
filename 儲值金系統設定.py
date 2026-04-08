@@ -325,20 +325,11 @@ def build_gsheet_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    import streamlit as st
-
-def build_gsheet_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
+    creds = Credentials.from_service_account_info(
+        st.secrets["GOOGLE_SERVICE_ACCOUNT"],
         scopes=scopes,
     )
 
-    return gspread.authorize(creds)
     return gspread.authorize(creds)
 
 def load_worksheet(sheet_name):
@@ -663,18 +654,12 @@ def build_gcal_service():
         return None
 
     scopes = ["https://www.googleapis.com/auth/calendar"]
-def build_gcal_service():
-    if not ENABLE_GCAL_COLOR_SYNC:
-        return None
 
-    scopes = ["https://www.googleapis.com/auth/calendar"]
-
-    credentials = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
+    credentials = Credentials.from_service_account_info(
+        st.secrets["GOOGLE_SERVICE_ACCOUNT"],
         scopes=scopes,
     )
 
-    return build("calendar", "v3", credentials=credentials)
     return build("calendar", "v3", credentials=credentials)
 
 
