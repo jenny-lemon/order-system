@@ -173,12 +173,14 @@ with col_env:
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
-# ── 執行設定（移除地區，工作表與列號留空）────────────────
+# ── 執行設定 ──────────────────────────────────────────────
 sec("執行設定")
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns(3)
 with c1:
-    sheet_name = st.text_input("工作表名稱", value="", placeholder="例：202604")
+    region     = st.selectbox("執行區域", ["台北", "台中", "桃園", "新竹", "高雄"])
 with c2:
+    sheet_name = st.text_input("工作表名稱", value="", placeholder="例：202604")
+with c3:
     row_input  = st.text_input("執行列號",   value="", placeholder="例：2,3,5-7")
 
 st.markdown('<div class="hint-box">💡 列號支援：單列 <code>2</code>、逗號分隔 <code>2,3,5</code>、區間 <code>2,3,5-7</code></div>', unsafe_allow_html=True)
@@ -237,6 +239,7 @@ if run_clicked:
             try:
                 result = run_process_web(
                     env_name=env,
+                    region=region,
                     backend_email=backend_email.strip(),
                     backend_password=backend_password.strip(),
                     sheet_name=sheet_name.strip(),
