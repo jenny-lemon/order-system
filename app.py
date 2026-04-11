@@ -16,8 +16,6 @@ html, body, [class*="css"] {
     padding-bottom: 1rem !important;
     max-width: 1100px !important;
 }
-
-/* 標題 */
 h1 {
     font-size: 19px !important;
     font-weight: 600 !important;
@@ -28,8 +26,6 @@ h1 {
     color: #aaa;
     margin-bottom: 14px;
 }
-
-/* section label */
 .sec-label {
     font-size: 11px;
     font-weight: 600;
@@ -38,8 +34,6 @@ h1 {
     text-transform: uppercase;
     margin: 0 0 6px 0;
 }
-
-/* Input / Select */
 [data-testid="stTextInput"] label,
 [data-testid="stNumberInput"] label,
 [data-testid="stSelectbox"] label,
@@ -67,15 +61,11 @@ h1 {
     font-size: 13.5px !important;
     background: #fff !important;
 }
-
-/* Multiselect */
 [data-testid="stMultiSelect"] > div > div {
     border-radius: 7px !important;
     border-color: #dde0e5 !important;
     font-size: 13px !important;
 }
-
-/* hint */
 .hint-box {
     background: #f9fafb;
     border: 1px solid #e8eaed;
@@ -84,10 +74,7 @@ h1 {
     font-size: 12px;
     color: #888;
     margin-top: 4px;
-    margin-bottom: 2px;
 }
-
-/* 執行按鈕 */
 [data-testid="stButton"] > button {
     background: #111 !important;
     color: #fff !important;
@@ -100,17 +87,29 @@ h1 {
     transition: background 0.15s !important;
 }
 [data-testid="stButton"] > button:hover { background: #333 !important; }
+[data-testid="stButton"] > button:disabled { background: #ccc !important; }
 
-/* Log */
+[data-testid="stExpander"] {
+    border: 1px solid #e4e6ea !important;
+    border-radius: 10px !important;
+    background: #fafafa !important;
+    overflow: hidden !important;
+}
+[data-testid="stExpander"] summary {
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    color: #666 !important;
+    letter-spacing: 0.04em !important;
+    padding: 10px 14px !important;
+}
 [data-testid="stCode"] {
     font-size: 11.5px !important;
-    border-radius: 8px !important;
+    border-radius: 0 0 10px 10px !important;
     max-height: 280px;
     overflow-y: auto;
     background: #13131f !important;
+    margin: 0 !important;
 }
-
-/* Metric */
 [data-testid="stMetric"] {
     background: #fff !important;
     border: 1px solid #e4e6ea !important;
@@ -130,9 +129,7 @@ h1 {
     font-weight: 700 !important;
     color: #111 !important;
 }
-
 hr { border-color: #ebebeb !important; margin: 12px 0 !important; }
-
 [data-testid="stAlert"] {
     border-radius: 8px !important;
     font-size: 13px !important;
@@ -141,7 +138,6 @@ hr { border-color: #ebebeb !important; margin: 12px 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── helpers ─────────────────────────────────────────────
 def sec(title):
     st.markdown(f'<p class="sec-label">{title}</p>', unsafe_allow_html=True)
 
@@ -166,7 +162,7 @@ def parse_row_input(row_text: str):
 st.title("💰 儲值金訂單系統")
 st.markdown('<p class="page-sub">支援建單、寄確認信、改 Google 日曆，可指定列號批次處理。</p>', unsafe_allow_html=True)
 
-# ── 帳密 + 環境（同列，與 memo 一致）────────────────────
+# ── 帳密 + 環境（與 memo 完全一致）──────────────────────
 col_e, col_p, col_env = st.columns([3.2, 3.2, 1.2])
 with col_e:
     backend_email    = st.text_input("後台帳號")
@@ -177,15 +173,13 @@ with col_env:
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
-# ── 執行設定 ──────────────────────────────────────────────
+# ── 執行設定（移除地區，工作表與列號留空）────────────────
 sec("執行設定")
-c1, c2, c3 = st.columns([1.5, 2, 2])
+c1, c2 = st.columns(2)
 with c1:
-    region = st.selectbox("執行區域", ["台北", "台中", "桃園", "新竹", "高雄"])
+    sheet_name = st.text_input("工作表名稱", value="", placeholder="例：202604")
 with c2:
-    sheet_name = st.text_input("工作表名稱", value="202604")
-with c3:
-    row_input = st.text_input("執行列號", value="2,3,5-7")
+    row_input  = st.text_input("執行列號",   value="", placeholder="例：2,3,5-7")
 
 st.markdown('<div class="hint-box">💡 列號支援：單列 <code>2</code>、逗號分隔 <code>2,3,5</code>、區間 <code>2,3,5-7</code></div>', unsafe_allow_html=True)
 
@@ -199,6 +193,7 @@ selected_actions = st.multiselect(
     default=["建單", "寄確認信", "改 Google 日曆"],
     label_visibility="collapsed",
 )
+st.markdown('<p style="font-size:12px;color:#bbb;margin-top:4px">可自由組合，例如只寄確認信、只改日曆，或全流程一起跑。</p>', unsafe_allow_html=True)
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -215,7 +210,6 @@ result_container = st.container()
 
 # ── 執行邏輯 ─────────────────────────────────────────────
 if run_clicked:
-    # 驗證
     if not backend_email.strip():
         st.error("請輸入後台帳號"); st.stop()
     if not backend_password.strip():
@@ -243,7 +237,6 @@ if run_clicked:
             try:
                 result = run_process_web(
                     env_name=env,
-                    region=region,
                     backend_email=backend_email.strip(),
                     backend_password=backend_password.strip(),
                     sheet_name=sheet_name.strip(),
