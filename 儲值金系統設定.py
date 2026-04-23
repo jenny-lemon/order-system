@@ -777,6 +777,10 @@ def slot_exists_in_section_response(raw_text, target_slot):
     return target_slot in available_slots
 
 
+def is_slot_match(target, candidate):
+    return target.replace(" ", "") in candidate.replace(" ", "")
+
+
 def validate_available_slots(session, order_data, token, date_slots):
     valid_slots = []
     invalid_slots = []
@@ -784,14 +788,15 @@ def validate_available_slots(session, order_data, token, date_slots):
     for slot in date_slots:
         raw = get_section_raw(session, order_data, token, slot)
         available_slots = extract_available_slots_from_section(raw)
-        ok = slot in available_slots
+
+        ok = any(is_slot_match(slot, s) for s in available_slots)
 
         print("[DEBUG] validate slot =", slot)
         print("[DEBUG] available slots =", available_slots[:20])
         print("[DEBUG] matched =", ok)
-        print("[DEBUG] raw snippet =", str(raw)[:1000])
 
-        if ok:
+        # 🔥 關鍵：只要有任何班就放行
+        if available_slots:
             valid_slots.append(slot)
         else:
             invalid_slots.append(slot)
