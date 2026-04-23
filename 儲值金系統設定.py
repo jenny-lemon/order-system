@@ -1,4 +1,6 @@
+import os
 import re
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -27,6 +29,11 @@ from env import (
     ORDER_PREFIX_DEV,
     ORDER_PREFIX_PROD,
 )
+
+try:
+    import streamlit as st
+except Exception:
+    st = None
 
 try:
     from env import GOOGLE_MAPS_API_KEY
@@ -88,6 +95,12 @@ KNOWN_SERVICE_STATUS = [
     "已取消",
     "待處理",
 ]
+
+
+# =========================
+# Debug 版本標記
+# =========================
+print("=== 儲值金系統設定.py 版本：2026-04-23-streamlit-fix-v1 ===")
 
 
 # =========================
@@ -294,8 +307,29 @@ def should_create_order(row):
 
 
 # =========================
-# 統一回填模板
+# XYZ 補值
 # =========================
+def finalize_xyz(meta=None, fallback_fare="0"):
+    meta = meta or {}
+
+    staff = str(meta.get("服務人員", "") or "").strip()
+    status = str(meta.get("服務狀態", "") or "").strip()
+    fare = str(meta.get("車馬費", "") or "").strip()
+
+    if not staff:
+        staff = "無人力"
+    if not status:
+        status = "未處理"
+    if not fare:
+        fare = str(fallback_fare or "0").strip() or "0"
+
+    return {
+        "服務人員": staff,
+        "服務狀態": status,
+        "車馬費": fare,
+    }
+
+
 def build_row_result(
     order_no="",
     result="失敗",
@@ -313,6 +347,15 @@ def build_row_result(
     service_status="未處理",
     fare="0",
 ):
+    xyz = finalize_xyz(
+        {
+            "服務人員": staff,
+            "服務狀態": service_status,
+            "車馬費": fare,
+        },
+        fallback_fare="0",
+    )
+
     return {
         "訂單編號": order_no,
         "結果": result,
@@ -326,24 +369,59 @@ def build_row_result(
         "日曆改色原因": calendar_reason,
         "日曆原色": calendar_old,
         "日曆新色": calendar_new,
-        "服務人員": staff if str(staff).strip() else "無人力",
-        "服務狀態": service_status if str(service_status).strip() else "未處理",
-        "車馬費": str(fare).strip() if str(fare).strip() else "0",
+        "服務人員": xyz["服務人員"],
+        "服務狀態": xyz["服務狀態"],
+        "車馬費": xyz["車馬費"],
     }
 
 
 # =========================
-# Google Sheet
+# Google 憑證 / Sheet
 # =========================
+def get_service_account_info():
+    # 1. Streamlit secrets
+    if st is not None:
+        try:
+            if "gcp_service_account" in st.secrets:
+                print("✅ 使用 Streamlit secrets[gcp_service_account]")
+                return dict(st.secrets["gcp_service_account"])
+        except Exception as e:
+            print(f"⚠️ 讀取 Streamlit secrets 失敗: {e}")
+
+    # 2. 環境變數 JSON 字串
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw_json:
+        try:
+            print("✅ 使用環境變數 GOOGLE_SERVICE_ACCOUNT_JSON")
+            return json.loads(raw_json)
+        except Exception as e:
+            raise Exception(f"GOOGLE_SERVICE_ACCOUNT_JSON 不是合法 JSON：{e}")
+
+    # 3. 本機檔案
+    candidate_files = []
+    if GOOGLE_SERVICE_ACCOUNT_FILE:
+        candidate_files.append(GOOGLE_SERVICE_ACCOUNT_FILE)
+    candidate_files.append("google_service_account.json")
+
+    for fp in candidate_files:
+        if fp and os.path.exists(fp):
+            print(f"✅ 使用本機憑證檔：{fp}")
+            with open(fp, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+    raise FileNotFoundError(
+        "找不到 Google 憑證。請在 Streamlit Secrets 設定 gcp_service_account，"
+        "或提供 GOOGLE_SERVICE_ACCOUNT_JSON，或放置 google_service_account.json。"
+    )
+
+
 def build_gsheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
-        scopes=scopes,
-    )
+    service_account_info = get_service_account_info()
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
     return gspread.authorize(creds)
 
 
@@ -403,6 +481,20 @@ def update_sheet_rows(ws, row_results):
 
     updates = []
     for row_num, info in row_results.items():
+        xyz = finalize_xyz(
+            {
+                "服務人員": info.get("服務人員", ""),
+                "服務狀態": info.get("服務狀態", ""),
+                "車馬費": info.get("車馬費", ""),
+            },
+            fallback_fare="0",
+        )
+        info["服務人員"] = xyz["服務人員"]
+        info["服務狀態"] = xyz["服務狀態"]
+        info["車馬費"] = xyz["車馬費"]
+
+        print(f"[DEBUG] write row={row_num} XYZ={xyz}")
+
         for key, value in info.items():
             if key not in header_index:
                 continue
@@ -489,9 +581,6 @@ def get_member(session, phone, token, clean_type_id):
 
 
 def pick_best_address_info(member_payload, target_address):
-    """
-    保留第一版成功邏輯：一定從會員既有地址列表選地址
-    """
     member = member_payload.get("member", {}) if isinstance(member_payload, dict) else {}
     member_address_list = member.get("memberAddressList", []) if isinstance(member, dict) else []
 
@@ -616,10 +705,6 @@ def get_section_raw(session, order_data, token, date_slot):
 
 
 def slot_exists_in_section_response(raw_text, date_slot):
-    """
-    嚴格判斷：必須完整命中 YYYY-MM-DD_HH:MM-HH:MM
-    不允許改送其他時段
-    """
     if not raw_text:
         return False
 
@@ -689,10 +774,6 @@ def fetch_order_no_by_date_and_period(session, target_date, target_period):
 def _extract_staff_line(lines):
     joined = "\n".join(lines)
     normalized = normalize_text_for_parse(joined)
-
-    m = re.search(r'([\u4e00-\u9fffA-Za-z0-9]+\(\\d+\))X([\u4e00-\u9fffA-Za-z0-9]+\(\\d+\))', normalized)
-    if m:
-        return f"{m.group(1)} X {m.group(2)}"
 
     m = re.search(r'([\u4e00-\u9fffA-Za-z0-9]+\(\d+\))X([\u4e00-\u9fffA-Za-z0-9]+\(\d+\))', normalized)
     if m:
@@ -816,10 +897,8 @@ def build_gcal_service():
         return None
 
     scopes = ["https://www.googleapis.com/auth/calendar"]
-    credentials = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
-        scopes=scopes,
-    )
+    service_account_info = get_service_account_info()
+    credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
     return build("calendar", "v3", credentials=credentials)
 
 
@@ -1121,47 +1200,6 @@ def has_action(selected_actions, action_name):
     return action_name in selected_actions
 
 
-def process_existing_order_only(row, gcal_service, region, session, selected_actions=None):
-    order_no = str(row.get("訂單編號", "")).strip()
-
-    if not order_no:
-        return build_row_result(
-            result="失敗",
-            reason="無訂單編號",
-            staff="無人力",
-            service_status="未處理",
-            fare="0",
-        )
-
-    meta = fetch_order_meta_by_order_no(session, order_no)
-
-    result = build_row_result(
-        order_no=order_no,
-        result="跳過",
-        reason="",
-        staff=meta.get("服務人員", "無人力"),
-        service_status=meta.get("服務狀態", "未處理"),
-        fare=meta.get("車馬費", "0"),
-    )
-
-    did_anything = False
-
-    if has_action(selected_actions, "寄確認信"):
-        result.update(stage_send_confirmation(order_no, session))
-        did_anything = True
-
-    if has_action(selected_actions, "改 Google 日曆"):
-        calendar_info = stage_calendar_color(row, gcal_service, region)
-        result.update(calendar_info)
-        result.update(stage_update_status(order_no, calendar_info))
-        did_anything = True
-
-    if did_anything:
-        result["結果"] = "成功"
-
-    return result
-
-
 def filter_dates_by_balance(date_slots, date_prices, stored_value):
     selected_slots = []
     selected_prices = []
@@ -1215,9 +1253,10 @@ def process_one_group(
     member = member_payload.get("member", {})
     stored_value = int(float(member_payload.get("storedValue", 0) or 0))
 
-    # 1. 一定要走既有地址下拉
     target_address = str(row0["地址"]).strip().split(",")[0]
     best_addr = pick_best_address_info(member_payload, target_address)
+    print("[DEBUG] best_addr =", best_addr)
+
     if not best_addr:
         raise Exception(f"下拉選單找不到對應地址：{target_address}")
     if not str(best_addr.get("addressId", "")).strip():
@@ -1225,13 +1264,11 @@ def process_one_group(
 
     selected_address = str(best_addr.get("address", "")).strip()
 
-    # 2. geocode（可選，有 key 才做）
     geo_lat, geo_lng = geocode_address(selected_address)
     if geo_lat and geo_lng:
         best_addr["lat"] = geo_lat
         best_addr["lng"] = geo_lng
 
-    # 3. 一定要按查詢地址 / 查詢地區
     addr_check = check_contain(
         session=session,
         member_id=member.get("member_id", ""),
@@ -1241,6 +1278,8 @@ def process_one_group(
         token=token,
         clean_type_id=clean_type_id,
     )
+    print("[DEBUG] addr_check =", addr_check)
+
     if not addr_check:
         raise Exception(f"查詢地區失敗：{selected_address}")
 
@@ -1267,7 +1306,6 @@ def process_one_group(
         or ""
     )
 
-    # 4. 保留第一版地址成功流程
     base_data = prepare_base_order_data(
         row=row0,
         member_payload=member_payload,
@@ -1279,7 +1317,6 @@ def process_one_group(
         note_info=mapped,
     )
 
-    # 5. calculate_hour
     calc_result = calculate_hour(session, base_data, token)
     if not calc_result:
         raise Exception("計算時數失敗")
@@ -1299,7 +1336,6 @@ def process_one_group(
     if calc_fields["fare"] not in ("", None):
         base_data["fare"] = calc_fields["fare"]
 
-    # 6. 每筆原始表單時段
     row_details = []
     for row_num, row in rows_with_idx:
         date_s = get_date_str(row["日期"])
@@ -1339,7 +1375,6 @@ def process_one_group(
             )
         return row_results
 
-    # 7. 非表單原時段不可執行
     raw_slots = [x["slot"] for x in row_details]
     valid_slots, invalid_slots = validate_available_slots(session, base_data, token, raw_slots)
 
@@ -1361,7 +1396,6 @@ def process_one_group(
     if not valid_details:
         return row_results
 
-    # 8. 餘額判斷
     valid_slots_for_balance = [x["slot"] for x in valid_details]
     valid_prices_for_balance = [x["price"] for x in valid_details]
     send_slots, send_prices, _ = filter_dates_by_balance(
@@ -1388,7 +1422,6 @@ def process_one_group(
     if not send_details:
         return row_results
 
-    # 9. 只能送原表單命中的時段
     batches = defaultdict(list)
     for detail in send_details:
         batches[detail["price"]].append(detail)
@@ -1397,9 +1430,21 @@ def process_one_group(
         payload = base_data.copy()
         payload["price"] = str(price)
         payload["price_vvip"] = "0"
-        payload["fare"] = str(base_data.get("fare", "0"))
+        payload["fare"] = str(base_data.get("fare") or best_addr.get("fare") or "0")
+        payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
+        payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
+        payload["company_id"] = str(base_data.get("company_id") or best_addr.get("company_id") or "")
+        payload["addressId"] = str(base_data.get("addressId") or best_addr.get("addressId") or "")
 
         slots = [d["slot"] for d in details]
+
+        print("[DEBUG] final address payload", {
+            "addressId": payload.get("addressId"),
+            "notice": payload.get("notice"),
+            "fare": payload.get("fare"),
+            "area_id": payload.get("area_id"),
+            "company_id": payload.get("company_id"),
+        })
 
         print("========== 最終建單 payload ==========")
         print({
@@ -1429,7 +1474,7 @@ def process_one_group(
             )
 
             if not order_no:
-                row_results[detail["row_num"]] = build_row_result(
+                stage_result = build_row_result(
                     result="失敗",
                     reason="送單後抓不到訂單編號",
                     sms_time=base_data.get("period", ""),
@@ -1438,6 +1483,8 @@ def process_one_group(
                     service_status="未處理",
                     fare=str(base_data.get("fare", "0")),
                 )
+                print("[DEBUG] stage_result =", stage_result)
+                row_results[detail["row_num"]] = stage_result
                 continue
 
             meta = fetch_order_meta_by_order_no(session, order_no)
@@ -1461,6 +1508,7 @@ def process_one_group(
                 stage_result.update(calendar_info)
                 stage_result.update(stage_update_status(order_no, calendar_info))
 
+            print("[DEBUG] stage_result =", stage_result)
             row_results[detail["row_num"]] = stage_result
 
     return row_results
@@ -1572,6 +1620,10 @@ def run_process(sheet_name, start_row, end_row, env_name_from_ui=None):
 
             time.sleep(REQUEST_DELAY)
 
+    print("[DEBUG] row_results keys =", list(all_row_results.keys()))
+    for row_num, info in all_row_results.items():
+        print("[DEBUG] final row", row_num, info.get("服務人員"), info.get("服務狀態"), info.get("車馬費"))
+
     update_sheet_rows(ws, all_row_results)
     print("已回填 Google Sheet。")
 
@@ -1599,6 +1651,8 @@ def run_process_web(
     selected_actions=None,
     logger=print,
 ):
+    logger("=== run_process_web 已進入：2026-04-23-streamlit-fix-v1 ===")
+
     global BASE_URL, ORDER_PREFIX
     if env_name == "dev":
         BASE_URL = BASE_URL_DEV
@@ -1748,6 +1802,10 @@ def run_process_web(
                 )
 
         time.sleep(REQUEST_DELAY)
+
+    logger(f"[DEBUG] row_results keys = {list(all_row_results.keys())}")
+    for row_num, info in all_row_results.items():
+        logger(f"[DEBUG] write row {row_num} {info.get('服務人員')} {info.get('服務狀態')} {info.get('車馬費')}")
 
     update_sheet_rows(ws, all_row_results)
     logger("已回填 Google Sheet。")
