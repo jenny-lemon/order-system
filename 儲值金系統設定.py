@@ -96,11 +96,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-
-# =========================
-# Debug 版本標記
-# =========================
-print("=== 儲值金系統設定.py 版本：2026-04-23-streamlit-fix-v1 ===")
+print("=== 儲值金系統設定.py 版本：2026-04-23-final-v2 ===")
 
 
 # =========================
@@ -121,6 +117,10 @@ def normalize_phone(phone_value):
 
 def normalize_text_for_parse(text):
     return re.sub(r"\s+", "", str(text or ""))
+
+
+def normalize_addr_for_match(addr):
+    return re.sub(r"\s+", "", str(addr or "")).strip()
 
 
 def parse_date_value(date_value):
@@ -183,10 +183,6 @@ def slot_start_hour(slot_text):
 
 def is_morning_slot(slot_text):
     return slot_start_hour(slot_text) < 12
-
-
-def normalize_addr_for_match(addr):
-    return re.sub(r"\s+", "", str(addr or "")).strip()
 
 
 def map_to_system_slot(start_time_str, end_time_str):
@@ -307,7 +303,7 @@ def should_create_order(row):
 
 
 # =========================
-# XYZ 補值
+# XYZ / 回填模板
 # =========================
 def finalize_xyz(meta=None, fallback_fare="0"):
     meta = meta or {}
@@ -379,16 +375,17 @@ def build_row_result(
 # Google 憑證 / Sheet
 # =========================
 def get_service_account_info():
-    # 1. Streamlit secrets
     if st is not None:
         try:
             if "gcp_service_account" in st.secrets:
                 print("✅ 使用 Streamlit secrets[gcp_service_account]")
                 return dict(st.secrets["gcp_service_account"])
+            if "GOOGLE_SERVICE_ACCOUNT" in st.secrets:
+                print("✅ 使用 Streamlit secrets[GOOGLE_SERVICE_ACCOUNT]")
+                return dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
         except Exception as e:
             print(f"⚠️ 讀取 Streamlit secrets 失敗: {e}")
 
-    # 2. 環境變數 JSON 字串
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if raw_json:
         try:
@@ -397,7 +394,6 @@ def get_service_account_info():
         except Exception as e:
             raise Exception(f"GOOGLE_SERVICE_ACCOUNT_JSON 不是合法 JSON：{e}")
 
-    # 3. 本機檔案
     candidate_files = []
     if GOOGLE_SERVICE_ACCOUNT_FILE:
         candidate_files.append(GOOGLE_SERVICE_ACCOUNT_FILE)
@@ -410,7 +406,7 @@ def get_service_account_info():
                 return json.load(f)
 
     raise FileNotFoundError(
-        "找不到 Google 憑證。請在 Streamlit Secrets 設定 gcp_service_account，"
+        "找不到 Google 憑證。請在 Streamlit Secrets 設定 gcp_service_account 或 GOOGLE_SERVICE_ACCOUNT，"
         "或提供 GOOGLE_SERVICE_ACCOUNT_JSON，或放置 google_service_account.json。"
     )
 
@@ -705,12 +701,29 @@ def get_section_raw(session, order_data, token, date_slot):
 
 
 def slot_exists_in_section_response(raw_text, date_slot):
+    """
+    支援畫面格式：
+    2026-05-12 (二) 08:30-12:30(...)
+    """
     if not raw_text:
         return False
 
+    try:
+        date_part, period_part = str(date_slot).split("_", 1)
+    except ValueError:
+        return False
+
     normalized = normalize_text_for_parse(raw_text)
-    target = normalize_text_for_parse(date_slot)
-    return target in normalized
+    date_part = date_part.strip()
+    period_part = period_part.strip()
+
+    if date_part not in normalized:
+        return False
+    if period_part not in normalized:
+        return False
+
+    pattern = re.escape(date_part) + r".{0,12}?" + re.escape(period_part)
+    return re.search(pattern, normalized) is not None
 
 
 def validate_available_slots(session, order_data, token, date_slots):
@@ -719,7 +732,13 @@ def validate_available_slots(session, order_data, token, date_slots):
 
     for slot in date_slots:
         raw = get_section_raw(session, order_data, token, slot)
-        if slot_exists_in_section_response(raw, slot):
+        ok = slot_exists_in_section_response(raw, slot)
+
+        print("[DEBUG] validate slot =", slot)
+        print("[DEBUG] raw snippet =", str(raw)[:500])
+        print("[DEBUG] matched =", ok)
+
+        if ok:
             valid_slots.append(slot)
         else:
             invalid_slots.append(slot)
@@ -1214,6 +1233,47 @@ def filter_dates_by_balance(date_slots, date_prices, stored_value):
     return selected_slots, selected_prices, total
 
 
+def process_existing_order_only(row, gcal_service, region, session, selected_actions=None):
+    order_no = str(row.get("訂單編號", "")).strip()
+
+    if not order_no:
+        return build_row_result(
+            result="失敗",
+            reason="無訂單編號",
+            staff="無人力",
+            service_status="未處理",
+            fare="0",
+        )
+
+    meta = fetch_order_meta_by_order_no(session, order_no)
+
+    result = build_row_result(
+        order_no=order_no,
+        result="跳過",
+        reason="",
+        staff=meta.get("服務人員", "無人力"),
+        service_status=meta.get("服務狀態", "未處理"),
+        fare=meta.get("車馬費", "0"),
+    )
+
+    did_anything = False
+
+    if has_action(selected_actions, "寄確認信"):
+        result.update(stage_send_confirmation(order_no, session))
+        did_anything = True
+
+    if has_action(selected_actions, "改 Google 日曆"):
+        calendar_info = stage_calendar_color(row, gcal_service, region)
+        result.update(calendar_info)
+        result.update(stage_update_status(order_no, calendar_info))
+        did_anything = True
+
+    if did_anything:
+        result["結果"] = "成功"
+
+    return result
+
+
 def process_one_group(
     session,
     rows_with_idx,
@@ -1253,6 +1313,7 @@ def process_one_group(
     member = member_payload.get("member", {})
     stored_value = int(float(member_payload.get("storedValue", 0) or 0))
 
+    # 1. 一定走既有地址下拉
     target_address = str(row0["地址"]).strip().split(",")[0]
     best_addr = pick_best_address_info(member_payload, target_address)
     print("[DEBUG] best_addr =", best_addr)
@@ -1264,11 +1325,13 @@ def process_one_group(
 
     selected_address = str(best_addr.get("address", "")).strip()
 
+    # 2. geocode
     geo_lat, geo_lng = geocode_address(selected_address)
     if geo_lat and geo_lng:
         best_addr["lat"] = geo_lat
         best_addr["lng"] = geo_lng
 
+    # 3. 一定做查詢地址 / 查詢地區
     addr_check = check_contain(
         session=session,
         member_id=member.get("member_id", ""),
@@ -1375,6 +1438,7 @@ def process_one_group(
             )
         return row_results
 
+    # 4. 非表單原時段不可送單
     raw_slots = [x["slot"] for x in row_details]
     valid_slots, invalid_slots = validate_available_slots(session, base_data, token, raw_slots)
 
@@ -1422,6 +1486,7 @@ def process_one_group(
     if not send_details:
         return row_results
 
+    # 5. 只能送原表單命中的時段
     batches = defaultdict(list)
     for detail in send_details:
         batches[detail["price"]].append(detail)
@@ -1651,7 +1716,7 @@ def run_process_web(
     selected_actions=None,
     logger=print,
 ):
-    logger("=== run_process_web 已進入：2026-04-23-streamlit-fix-v1 ===")
+    logger("=== run_process_web 已進入：2026-04-23-final-v2 ===")
 
     global BASE_URL, ORDER_PREFIX
     if env_name == "dev":
