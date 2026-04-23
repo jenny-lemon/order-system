@@ -96,7 +96,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-23-final-v2 ===")
+print("=== 儲值金系統設定.py 版本：2026-04-23-final-v3 ===")
 
 
 # =========================
@@ -1462,7 +1462,7 @@ def process_one_group(
 
     valid_slots_for_balance = [x["slot"] for x in valid_details]
     valid_prices_for_balance = [x["price"] for x in valid_details]
-    send_slots, send_prices, _ = filter_dates_by_balance(
+    send_slots, _, _ = filter_dates_by_balance(
         valid_slots_for_balance,
         valid_prices_for_balance,
         stored_value,
@@ -1486,14 +1486,10 @@ def process_one_group(
     if not send_details:
         return row_results
 
-    # 5. 只能送原表單命中的時段
-    batches = defaultdict(list)
+    # 5. 每一列各自送單，避免日期混掉
     for detail in send_details:
-        batches[detail["price"]].append(detail)
-
-    for price, details in batches.items():
         payload = base_data.copy()
-        payload["price"] = str(price)
+        payload["price"] = str(detail["price"])
         payload["price_vvip"] = "0"
         payload["fare"] = str(base_data.get("fare") or best_addr.get("fare") or "0")
         payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
@@ -1501,80 +1497,70 @@ def process_one_group(
         payload["company_id"] = str(base_data.get("company_id") or best_addr.get("company_id") or "")
         payload["addressId"] = str(base_data.get("addressId") or best_addr.get("addressId") or "")
 
-        slots = [d["slot"] for d in details]
+        target_slot = detail["slot"]
 
-        print("[DEBUG] final address payload", {
+        print("[DEBUG] final booking payload =", {
+            "row_num": detail["row_num"],
+            "target_slot": target_slot,
             "addressId": payload.get("addressId"),
-            "notice": payload.get("notice"),
             "fare": payload.get("fare"),
+            "notice": payload.get("notice"),
             "area_id": payload.get("area_id"),
             "company_id": payload.get("company_id"),
         })
 
-        print("========== 最終建單 payload ==========")
-        print({
-            "addressId": payload.get("addressId"),
-            "address": payload.get("address"),
-            "notice": payload.get("notice"),
-            "fare": payload.get("fare"),
-            "price": payload.get("price"),
-            "period_s": payload.get("period_s"),
-            "date_list[]": slots,
-        })
-
         session.post(
             BOOKING_URL,
-            data={**payload, "_token": token, "date_list[]": slots},
+            data={**payload, "_token": token, "date_list[]": [target_slot]},
             headers=HEADERS,
             allow_redirects=True,
         )
 
         time.sleep(1)
 
-        for detail in details:
-            order_no = fetch_order_no_by_date_and_period(
-                session=session,
-                target_date=detail["date"],
-                target_period=detail["display_period"].replace(" ", ""),
-            )
+        order_no = fetch_order_no_by_date_and_period(
+            session=session,
+            target_date=detail["date"],
+            target_period=detail["display_period"].replace(" ", ""),
+        )
 
-            if not order_no:
-                stage_result = build_row_result(
-                    result="失敗",
-                    reason="送單後抓不到訂單編號",
-                    sms_time=base_data.get("period", ""),
-                    customer_note=base_data.get("memo", ""),
-                    staff="無人力",
-                    service_status="未處理",
-                    fare=str(base_data.get("fare", "0")),
-                )
-                print("[DEBUG] stage_result =", stage_result)
-                row_results[detail["row_num"]] = stage_result
-                continue
-
-            meta = fetch_order_meta_by_order_no(session, order_no)
-
+        if not order_no:
             stage_result = build_row_result(
-                order_no=order_no,
-                result="成功",
-                reason="",
+                result="失敗",
+                reason=f"送單後抓不到訂單編號（目標時段：{target_slot}）",
                 sms_time=base_data.get("period", ""),
                 customer_note=base_data.get("memo", ""),
-                staff=meta.get("服務人員", "無人力"),
-                service_status=meta.get("服務狀態", "未處理"),
-                fare=meta.get("車馬費", "0") or str(base_data.get("fare", "0")),
+                staff="無人力",
+                service_status="未處理",
+                fare=str(base_data.get("fare", "0")),
             )
-
-            if has_action(selected_actions, "寄確認信"):
-                stage_result.update(stage_send_confirmation(order_no, session))
-
-            if has_action(selected_actions, "改 Google 日曆"):
-                calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
-                stage_result.update(calendar_info)
-                stage_result.update(stage_update_status(order_no, calendar_info))
-
             print("[DEBUG] stage_result =", stage_result)
             row_results[detail["row_num"]] = stage_result
+            continue
+
+        meta = fetch_order_meta_by_order_no(session, order_no)
+
+        stage_result = build_row_result(
+            order_no=order_no,
+            result="成功",
+            reason="",
+            sms_time=base_data.get("period", ""),
+            customer_note=base_data.get("memo", ""),
+            staff=meta.get("服務人員", "無人力"),
+            service_status=meta.get("服務狀態", "未處理"),
+            fare=meta.get("車馬費", "0") or str(base_data.get("fare", "0")),
+        )
+
+        if has_action(selected_actions, "寄確認信"):
+            stage_result.update(stage_send_confirmation(order_no, session))
+
+        if has_action(selected_actions, "改 Google 日曆"):
+            calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
+            stage_result.update(calendar_info)
+            stage_result.update(stage_update_status(order_no, calendar_info))
+
+        print("[DEBUG] stage_result =", stage_result)
+        row_results[detail["row_num"]] = stage_result
 
     return row_results
 
@@ -1716,7 +1702,7 @@ def run_process_web(
     selected_actions=None,
     logger=print,
 ):
-    logger("=== run_process_web 已進入：2026-04-23-final-v2 ===")
+    logger("=== run_process_web 已進入：2026-04-23-final-v3 ===")
 
     global BASE_URL, ORDER_PREFIX
     if env_name == "dev":
