@@ -97,7 +97,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-23-old-base-plus-address-checkcontain-xyz ===")
+print("=== 儲值金系統設定.py 版本：2026-04-23-old-base-address-checkcontain-xyz-final ===")
 
 
 # =========================
@@ -176,24 +176,12 @@ def parse_time_slot(start_time_str, end_time_str):
 
 
 def calc_hours_from_time(start_time_str, end_time_str):
-    """
-    原始時長：
-    10:00-12:00 -> 2
-    09:00-16:00 -> 7
-    09:00-18:00 -> 9
-    """
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
     hours = (eh - sh) + (em - sm) / 60.0
     return hours if hours > 0 else None
 
 
 def calc_effective_hours_from_time(start_time_str, end_time_str):
-    """
-    有效工時：
-    >= 7 小時扣午休 1 小時
-    09:00-16:00 -> 6
-    09:00-18:00 -> 8
-    """
     hours = calc_hours_from_time(start_time_str, end_time_str)
     if hours is None:
         return None
@@ -634,9 +622,6 @@ def get_member(session, phone, token, clean_type_id):
 
 
 def pick_best_address_info(member_payload, target_address):
-    """
-    新版補強：優先用 member.memberAddressList 的實際下拉地址資料
-    """
     member = member_payload.get("member", {}) if isinstance(member_payload, dict) else {}
     purchase = member_payload.get("purchase", {}) if isinstance(member_payload, dict) else {}
     address_list = member_payload.get("address", []) if isinstance(member_payload, dict) else []
@@ -772,6 +757,30 @@ def calculate_hour(session, order_data, token):
         return None
 
 
+def extract_calc_fields(calc_result, fallback_hours="", fallback_fare="0"):
+    if not isinstance(calc_result, dict):
+        return {
+            "hour": str(fallback_hours or ""),
+            "price": "0",
+            "price_vvip": "0",
+            "fare": str(fallback_fare or "0"),
+        }
+
+    def pick(*keys, default=""):
+        for k in keys:
+            v = calc_result.get(k)
+            if v not in (None, ""):
+                return str(v)
+        return str(default)
+
+    return {
+        "hour": pick("hour", "clean_hour", default=fallback_hours or ""),
+        "price": pick("price", "total_price", "service_price", default="0"),
+        "price_vvip": pick("price_vvip", "vvip_price", default="0"),
+        "fare": pick("fare", "car_fare", default=fallback_fare or "0"),
+    }
+
+
 def get_section_raw(session, order_data, token, date_slot):
     data = order_data.copy()
     data["_token"] = token
@@ -782,9 +791,6 @@ def get_section_raw(session, order_data, token, date_slot):
 
 
 def slot_exists_in_section_response(raw_text, date_slot):
-    """
-    保留舊版穩定邏輯：直接在 raw response 搜日期 + 時段
-    """
     if not raw_text:
         return False
 
@@ -792,17 +798,6 @@ def slot_exists_in_section_response(raw_text, date_slot):
     normalized = re.sub(r"\s+", "", raw_text)
     pattern = re.escape(date_part) + r".*?" + re.escape(period_part)
     return re.search(pattern, normalized) is not None
-
-
-def validate_available_slots(session, order_data, token, date_slots):
-    valid_slots, invalid_slots = [], []
-    for slot in date_slots:
-        raw = get_section_raw(session, order_data, token, slot)
-        if slot_exists_in_section_response(raw, slot):
-            valid_slots.append(slot)
-        else:
-            invalid_slots.append(slot)
-    return valid_slots, invalid_slots
 
 
 # =========================
@@ -1362,14 +1357,6 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         mapped,
     )
 
-    calc_date = get_date_str(row0["日期"])
-    calc_data = base_data.copy()
-    calc_data["date_s"] = calc_date
-
-    calc_result = calculate_hour(session, calc_data, token)
-    if not calc_result:
-        raise Exception("計算時數失敗")
-
     def build_time_fields():
         sms_time = base_data.get("period", "")
         customer_note = base_data.get("memo", "")
@@ -1378,16 +1365,47 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             customer_note = f"服務時間：{mapped['original_slot']}"
         return sms_time, customer_note
 
+    def build_priced_payload_for_date(date_s):
+        calc_data = base_data.copy()
+        calc_data["date_s"] = date_s
+
+        calc_result = calculate_hour(session, calc_data, token)
+        if not calc_result:
+            raise Exception(f"計算時數失敗：{date_s}")
+
+        calc_fields = extract_calc_fields(
+            calc_result,
+            fallback_hours=base_data.get("hour", ""),
+            fallback_fare=best_addr.get("fare", "0"),
+        )
+
+        payload = base_data.copy()
+        payload["date_s"] = date_s
+        payload["hour"] = str(calc_fields.get("hour") or base_data.get("hour") or "")
+        payload["price"] = str(calc_fields.get("price") or "0")
+        payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
+
+        # 車馬費獨立帶出，不算在儲值金中
+        payload["fare"] = str(calc_fields.get("fare") or best_addr.get("fare") or "0")
+        payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
+        payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
+        payload["company_id"] = str(base_data.get("company_id") or best_addr.get("company_id") or "")
+        payload["addressId"] = str(base_data.get("addressId") or best_addr.get("addressId") or "")
+        return payload
+
     row_details = []
     for row_num, row in rows_with_idx:
         date_s = get_date_str(row["日期"])
+        priced_payload = build_priced_payload_for_date(date_s)
+
         row_details.append({
             "row_num": row_num,
             "date": date_s,
             "slot": f"{date_s}_{system_period}",
-            "price": calc_occurrence_price(row["日期"], people, hours),
+            "price": int(float(priced_payload.get("price") or 0)),  # 只拿服務費比對儲值金
             "display_period": system_display_period,
             "row": row,
+            "payload": priced_payload,
         })
 
     need_create_order = has_action(selected_actions, "建單")
@@ -1429,14 +1447,13 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
         return row_results
 
-    raw_slots = [x["slot"] for x in row_details]
-    valid_slots, invalid_slots = validate_available_slots(session, base_data, token, raw_slots)
-
+    # 每一筆用自己的 priced payload 查班表
     no_slot_dates = []
     valid_details = []
 
     for detail in row_details:
-        if detail["slot"] in valid_slots:
+        raw = get_section_raw(session, detail["payload"], token, detail["slot"])
+        if slot_exists_in_section_response(raw, detail["slot"]):
             valid_details.append(detail)
         else:
             no_slot_dates.append(detail["date"])
@@ -1459,7 +1476,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
     valid_slots_for_balance = [x["slot"] for x in valid_details]
     valid_prices_for_balance = [x["price"] for x in valid_details]
-    send_slots, send_prices, _ = filter_dates_by_balance(valid_slots_for_balance, valid_prices_for_balance, stored_value)
+    send_slots, _, _ = filter_dates_by_balance(valid_slots_for_balance, valid_prices_for_balance, stored_value)
 
     insufficient_dates = []
     send_details = []
@@ -1495,28 +1512,27 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 status_value="",
                 staff="無人力",
                 service_status="未處理",
-                fare=str(base_data.get("fare", "0")),
+                fare=str(detail["payload"].get("fare") or "0"),
             )
 
     if not send_details:
         return row_results
 
-    batches = defaultdict(list)
+    # 為安全與一致性，每筆單獨送出
     for detail in send_details:
-        batches[detail["price"]].append(detail)
+        payload = detail["payload"].copy()
+        slots = [detail["slot"]]
 
-    for price, details in batches.items():
-        payload = base_data.copy()
-        payload["price"] = str(price)
-        payload["price_vvip"] = "0"
-        payload["fare"] = str(base_data.get("fare") or best_addr.get("fare") or "0")
-        payload["notice"] = str(base_data.get("notice") or "")
-        payload["area_id"] = str(base_data.get("area_id") or "")
-        payload["company_id"] = str(base_data.get("company_id") or "")
-        payload["addressId"] = str(base_data.get("addressId") or "")
-        payload["date_s"] = details[0]["date"]
-
-        slots = [d["slot"] for d in details]
+        print("[DEBUG] booking payload =",
+              {
+                  "date": detail["date"],
+                  "slot": detail["slot"],
+                  "price": payload.get("price"),
+                  "fare": payload.get("fare"),
+                  "addressId": payload.get("addressId"),
+                  "area_id": payload.get("area_id"),
+                  "company_id": payload.get("company_id"),
+              })
 
         session.post(
             BOOKING_URL,
@@ -1527,46 +1543,45 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
         time.sleep(1)
 
-        for detail in details:
-            order_no = fetch_order_no_by_date_and_period(session, detail["date"], detail["display_period"])
-            sms_time, customer_note = build_time_fields()
+        order_no = fetch_order_no_by_date_and_period(session, detail["date"], detail["display_period"])
+        sms_time, customer_note = build_time_fields()
 
-            if not order_no:
-                row_results[detail["row_num"]] = build_row_result(
-                    result="已送出",
-                    reason="抓不到訂單編號",
-                    sms_time=sms_time,
-                    customer_note=customer_note,
-                    status_value="",
-                    staff="無人力",
-                    service_status="未處理",
-                    fare=str(base_data.get("fare", "0")),
-                )
-                continue
-
-            meta = fetch_order_meta_by_order_no(session, order_no)
-
-            stage_result = build_row_result(
-                order_no=order_no,
-                result="成功",
-                reason="",
+        if not order_no:
+            row_results[detail["row_num"]] = build_row_result(
+                result="已送出",
+                reason="抓不到訂單編號",
                 sms_time=sms_time,
                 customer_note=customer_note,
                 status_value="",
-                staff=meta.get("服務人員", "無人力"),
-                service_status=meta.get("服務狀態", "未處理"),
-                fare=meta.get("車馬費", "0") or str(base_data.get("fare", "0")),
+                staff="無人力",
+                service_status="未處理",
+                fare=str(detail["payload"].get("fare") or "0"),
             )
+            continue
 
-            if has_action(selected_actions, "寄確認信"):
-                stage_result.update(stage_send_confirmation(order_no, session))
+        meta = fetch_order_meta_by_order_no(session, order_no)
 
-            if has_action(selected_actions, "改 Google 日曆"):
-                calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
-                stage_result.update(calendar_info)
-                stage_result.update(stage_update_status(order_no, calendar_info))
+        stage_result = build_row_result(
+            order_no=order_no,
+            result="成功",
+            reason="",
+            sms_time=sms_time,
+            customer_note=customer_note,
+            status_value="",
+            staff=meta.get("服務人員", "無人力"),
+            service_status=meta.get("服務狀態", "未處理"),
+            fare=meta.get("車馬費", "0") or str(detail["payload"].get("fare") or "0"),
+        )
 
-            row_results[detail["row_num"]] = stage_result
+        if has_action(selected_actions, "寄確認信"):
+            stage_result.update(stage_send_confirmation(order_no, session))
+
+        if has_action(selected_actions, "改 Google 日曆"):
+            calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
+            stage_result.update(calendar_info)
+            stage_result.update(stage_update_status(order_no, calendar_info))
+
+        row_results[detail["row_num"]] = stage_result
 
     return row_results
 
