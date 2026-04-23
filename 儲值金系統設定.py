@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import json
@@ -60,10 +61,7 @@ CALCULATE_HOUR_URL = f"{BASE_URL}/ajax/calculate_hour"
 GET_SECTION_URL = f"{BASE_URL}/ajax/get_section"
 MAIL_SUCCESS_URL = f"{BASE_URL}/purchase/mail_success/{{order_no}}"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-}
-
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 MAIL_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "User-Agent": "Mozilla/5.0",
@@ -78,6 +76,7 @@ CLEAN_TYPE_MAP = {
 
 ORDER_NO_REGEX = r"(LC|TT)\d+"
 
+# 以舊版穩定送單邏輯為底：保留 09-16 / 09-18
 STANDARD_SLOTS = [
     "08:30-12:30",
     "09:00-11:00",
@@ -85,6 +84,8 @@ STANDARD_SLOTS = [
     "14:00-16:00",
     "14:00-17:00",
     "14:00-18:00",
+    "09:00-16:00",
+    "09:00-18:00",
 ]
 
 KNOWN_SERVICE_STATUS = [
@@ -96,7 +97,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-23-final-v5 ===")
+print("=== 儲值金系統設定.py 版本：2026-04-23-old-base-plus-address-checkcontain-xyz ===")
 
 
 # =========================
@@ -107,8 +108,7 @@ def is_blank(value):
 
 
 def normalize_phone(phone_value):
-    phone = str(phone_value).strip()
-    phone = phone.replace(".0", "")
+    phone = str(phone_value).strip().replace(".0", "")
     phone = re.sub(r"\D", "", phone)
     if len(phone) == 9:
         phone = "0" + phone
@@ -121,6 +121,10 @@ def normalize_text_for_parse(text):
 
 def normalize_addr_for_match(addr):
     return re.sub(r"\s+", "", str(addr or "")).strip()
+
+
+def same_address(a, b):
+    return normalize_addr_for_match(a) == normalize_addr_for_match(b)
 
 
 def parse_date_value(date_value):
@@ -137,15 +141,33 @@ def parse_date_value(date_value):
     raise Exception(f"無法解析日期: {date_value}")
 
 
-def normalize_sheet_date(date_value):
+def get_date_str(date_value):
     return parse_date_value(date_value).strftime("%Y-%m-%d")
 
 
+def normalize_sheet_date(date_value):
+    return get_date_str(date_value)
+
+
+def is_weekend(date_value):
+    return parse_date_value(date_value).weekday() >= 5
+
+
+def get_unit_price_by_date(date_value):
+    return 700 if is_weekend(date_value) else 600
+
+
 def parse_time_slot(start_time_str, end_time_str):
+    if not str(start_time_str).strip() or not str(end_time_str).strip():
+        raise Exception(f"開始時間或結束時間為空：{start_time_str} / {end_time_str}")
+
     def to_hm(t):
-        parts = str(t).strip().split(":")
+        text = str(t).strip()
+        parts = text.split(":")
+        if not parts or not parts[0].strip():
+            raise Exception(f"時間格式錯誤：{t}")
         h = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 0
+        m = int(parts[1]) if len(parts) > 1 and parts[1].strip() else 0
         return h, m
 
     sh, sm = to_hm(start_time_str)
@@ -155,29 +177,29 @@ def parse_time_slot(start_time_str, end_time_str):
 
 def calc_hours_from_time(start_time_str, end_time_str):
     """
-    規則：
-    10:00-12:00 -> 2 小時
-    09:00-16:00 -> 7 - 1 = 6 小時
-    09:00-18:00 -> 9 - 1 = 8 小時
-    只要跨過 12:00~13:00 午休就扣 1 小時
+    原始時長：
+    10:00-12:00 -> 2
+    09:00-16:00 -> 7
+    09:00-18:00 -> 9
     """
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
+    hours = (eh - sh) + (em - sm) / 60.0
+    return hours if hours > 0 else None
 
-    start_minutes = sh * 60 + sm
-    end_minutes = eh * 60 + em
 
-    total_hours = (end_minutes - start_minutes) / 60.0
-    if total_hours <= 0:
+def calc_effective_hours_from_time(start_time_str, end_time_str):
+    """
+    有效工時：
+    >= 7 小時扣午休 1 小時
+    09:00-16:00 -> 6
+    09:00-18:00 -> 8
+    """
+    hours = calc_hours_from_time(start_time_str, end_time_str)
+    if hours is None:
         return None
-
-    lunch_start = 12 * 60
-    lunch_end = 13 * 60
-
-    crosses_lunch = start_minutes < lunch_start and end_minutes > lunch_end
-    if crosses_lunch:
-        total_hours -= 1
-
-    return total_hours
+    if hours >= 7:
+        hours -= 1
+    return hours
 
 
 def normalize_period_text(start_time_str, end_time_str):
@@ -202,26 +224,43 @@ def build_target_slot_from_row(row):
 
 def slot_duration_hours(slot_text):
     start_text, end_text = slot_text.split("-")
-    return calc_hours_from_time(start_text, end_text)
+    return calc_effective_hours_from_time(start_text, end_text)
 
 
 def slot_start_hour(slot_text):
-    start_text = slot_text.split("-")[0]
-    return int(start_text.split(":")[0])
+    return int(slot_text.split("-")[0].split(":")[0])
 
 
 def is_morning_slot(slot_text):
     return slot_start_hour(slot_text) < 12
 
 
-def map_to_system_slot(start_time_str, end_time_str):
+def map_to_system_slot(start_time_str, end_time_str, service_text=None):
+    """
+    以舊版穩定邏輯為主：
+    - 先看服務人時欄位的小時數
+    - 找對應 system_slot
+    - 非標準時段要留下原始時間給簡訊/客備
+    """
     original_slot = normalize_period_text(start_time_str, end_time_str)
-    actual_hours = calc_hours_from_time(start_time_str, end_time_str)
+    actual_hours = None
+
+    if service_text and str(service_text).strip():
+        match = re.search(r"(\d+)\s*人\s*(\d+(?:\.\d+)?)\s*小時", str(service_text))
+        if match:
+            actual_hours = float(match.group(2))
+        else:
+            match = re.search(r"(\d+(?:\.\d+)?)\s*小時", str(service_text))
+            if match:
+                actual_hours = float(match.group(1))
+
+    if actual_hours is None:
+        actual_hours = calc_effective_hours_from_time(start_time_str, end_time_str)
 
     if actual_hours is None:
         raise Exception(f"無法解析服務時段: {start_time_str}-{end_time_str}")
 
-    # 🔥 強制規則：10-12 → 09-11
+    # 強制規則：10-12 送 09-11，但保留原始時間做備註
     if original_slot == "10:00-12:00":
         return {
             "original_slot": original_slot,
@@ -231,7 +270,6 @@ def map_to_system_slot(start_time_str, end_time_str):
             "customer_time_note": f"服務時間：{original_slot}",
         }
 
-    # 標準時段
     if original_slot in STANDARD_SLOTS:
         return {
             "original_slot": original_slot,
@@ -241,17 +279,17 @@ def map_to_system_slot(start_time_str, end_time_str):
             "customer_time_note": "",
         }
 
-    # 非標準 → 找最接近
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
+    original_is_morning = sh < 12
 
     matched_slot = None
     for slot in STANDARD_SLOTS:
-        if abs(slot_duration_hours(slot) - actual_hours) < 1e-9:
+        if is_morning_slot(slot) == original_is_morning and abs(slot_duration_hours(slot) - actual_hours) < 1e-9:
             matched_slot = slot
             break
 
     if not matched_slot:
-        raise Exception(f"找不到可對應的系統時段：{original_slot}")
+        raise Exception(f"找不到可對應的系統時段：原始時段 {original_slot}，時數 {actual_hours}")
 
     return {
         "original_slot": original_slot,
@@ -262,33 +300,34 @@ def map_to_system_slot(start_time_str, end_time_str):
     }
 
 
-def parse_service_human_hour(cell_value, start_time_str=None, end_time_str=None):
-    default_people = 2
+def parse_service_human_hour(service_text, start_time, end_time):
+    if service_text and str(service_text).strip():
+        text = str(service_text).strip()
+        people_match = re.search(r"(\d+)\s*人", text)
+        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*小時", text)
 
-    if pd.isna(cell_value) or str(cell_value).strip() == "":
-        people = default_people
-        hours = calc_hours_from_time(start_time_str, end_time_str)
-        return people, hours
+        people = int(people_match.group(1)) if people_match else 2
+        if hour_match:
+            hours = float(hour_match.group(1))
+            return people, int(hours) if float(hours).is_integer() else hours
 
-    text = str(cell_value).strip()
-    people_match = re.search(r"(\d+)\s*人", text)
-    hour_match = re.search(r"(\d+(?:\.\d+)?)\s*小時", text)
+    hours = calc_effective_hours_from_time(start_time, end_time)
+    if hours is None:
+        return None, None
 
-    people = int(people_match.group(1)) if people_match else default_people
-    hours = float(hour_match.group(1)) if hour_match else calc_hours_from_time(start_time_str, end_time_str)
-
-    return people, hours
+    return 2, int(hours) if float(hours).is_integer() else hours
 
 
 def normalize_hours_text(cell_value, start_time_str=None, end_time_str=None):
     people, hours = parse_service_human_hour(cell_value, start_time_str, end_time_str)
     if hours is None:
         return f"{people}人"
-    if float(hours).is_integer():
-        htxt = f"{int(hours)}小時"
-    else:
-        htxt = f"{hours}小時"
+    htxt = f"{int(hours)}小時" if float(hours).is_integer() else f"{hours}小時"
     return f"{people}人{htxt}"
+
+
+def calc_occurrence_price(date_value, people, hours):
+    return int(get_unit_price_by_date(date_value) * people * hours)
 
 
 def build_group_key(row):
@@ -330,15 +369,11 @@ def get_region_by_address(address, accounts_config):
 
 
 def should_process_row(row):
-    status = str(row.get("狀態", "")).strip()
-    order_no = row.get("訂單編號", "")
-    return status == "未安排" and is_blank(order_no)
+    return str(row.get("狀態", "")).strip() == "未安排" and is_blank(row.get("訂單編號", ""))
 
 
 def should_create_order(row):
-    status = str(row.get("狀態", "")).strip()
-    order_no = row.get("訂單編號", "")
-    return status == "未安排" and is_blank(order_no)
+    return str(row.get("狀態", "")).strip() == "未安排" and is_blank(row.get("訂單編號", ""))
 
 
 # =========================
@@ -378,6 +413,7 @@ def build_row_result(
     calendar_reason="",
     calendar_old="",
     calendar_new="",
+    status_value="",
     staff="無人力",
     service_status="未處理",
     fare="0",
@@ -388,7 +424,7 @@ def build_row_result(
             "服務狀態": service_status,
             "車馬費": fare,
         },
-        fallback_fare="0",
+        fallback_fare=fare or "0",
     )
 
     return {
@@ -404,6 +440,7 @@ def build_row_result(
         "日曆改色原因": calendar_reason,
         "日曆原色": calendar_old,
         "日曆新色": calendar_new,
+        "狀態": status_value,
         "服務人員": xyz["服務人員"],
         "服務狀態": xyz["服務狀態"],
         "車馬費": xyz["車馬費"],
@@ -417,18 +454,15 @@ def get_service_account_info():
     if st is not None:
         try:
             if "gcp_service_account" in st.secrets:
-                print("✅ 使用 Streamlit secrets[gcp_service_account]")
                 return dict(st.secrets["gcp_service_account"])
             if "GOOGLE_SERVICE_ACCOUNT" in st.secrets:
-                print("✅ 使用 Streamlit secrets[GOOGLE_SERVICE_ACCOUNT]")
                 return dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
-        except Exception as e:
-            print(f"⚠️ 讀取 Streamlit secrets 失敗: {e}")
+        except Exception:
+            pass
 
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if raw_json:
         try:
-            print("✅ 使用環境變數 GOOGLE_SERVICE_ACCOUNT_JSON")
             return json.loads(raw_json)
         except Exception as e:
             raise Exception(f"GOOGLE_SERVICE_ACCOUNT_JSON 不是合法 JSON：{e}")
@@ -440,12 +474,11 @@ def get_service_account_info():
 
     for fp in candidate_files:
         if fp and os.path.exists(fp):
-            print(f"✅ 使用本機憑證檔：{fp}")
             with open(fp, "r", encoding="utf-8") as f:
                 return json.load(f)
 
     raise FileNotFoundError(
-        "找不到 Google 憑證。請在 Streamlit Secrets 設定 gcp_service_account 或 GOOGLE_SERVICE_ACCOUNT，"
+        "找不到 Google 憑證。請在 Streamlit secrets 設定 gcp_service_account 或 GOOGLE_SERVICE_ACCOUNT，"
         "或提供 GOOGLE_SERVICE_ACCOUNT_JSON，或放置 google_service_account.json。"
     )
 
@@ -478,7 +511,6 @@ def load_worksheet(sheet_name):
 
 def ensure_columns_in_sheet(ws):
     headers = ws.row_values(1)
-
     required = [
         "簡訊實際服務時間",
         "客人備註",
@@ -492,6 +524,7 @@ def ensure_columns_in_sheet(ws):
         "日曆改色原因",
         "日曆原色",
         "日曆新色",
+        "狀態",
         "服務人員",
         "服務狀態",
         "車馬費",
@@ -513,8 +546,8 @@ def ensure_columns_in_sheet(ws):
 def update_sheet_rows(ws, row_results):
     headers = ensure_columns_in_sheet(ws)
     header_index = {h: i + 1 for i, h in enumerate(headers)}
-
     updates = []
+
     for row_num, info in row_results.items():
         xyz = finalize_xyz(
             {
@@ -522,21 +555,18 @@ def update_sheet_rows(ws, row_results):
                 "服務狀態": info.get("服務狀態", ""),
                 "車馬費": info.get("車馬費", ""),
             },
-            fallback_fare="0",
+            fallback_fare=info.get("車馬費", "0"),
         )
         info["服務人員"] = xyz["服務人員"]
         info["服務狀態"] = xyz["服務狀態"]
         info["車馬費"] = xyz["車馬費"]
 
-        print(f"[DEBUG] write row={row_num} XYZ={xyz}")
-
         for key, value in info.items():
-            if key not in header_index:
-                continue
-            updates.append({
-                "range": gspread.utils.rowcol_to_a1(row_num, header_index[key]),
-                "values": [[("" if value is None else str(value))]],
-            })
+            if key in header_index:
+                updates.append({
+                    "range": gspread.utils.rowcol_to_a1(row_num, header_index[key]),
+                    "values": [[("" if value is None else str(value))]],
+                })
 
     if updates:
         ws.batch_update(updates)
@@ -548,32 +578,24 @@ def update_sheet_rows(ws, row_results):
 def login(session, email, password):
     resp = session.get(LOGIN_URL, headers=HEADERS, allow_redirects=True)
     if resp.status_code != 200:
-        print(f"取得登入頁失敗: {resp.status_code}")
         return False
 
     soup = BeautifulSoup(resp.text, "html.parser")
     token_input = soup.find("input", {"name": "_token"})
     if not token_input:
-        print("登入失敗：找不到 _token")
         return False
 
     token = token_input.get("value", "").strip()
     if not token:
-        print("登入失敗：_token 為空")
         return False
 
-    data = {
-        "_token": token,
-        "email": email,
-        "password": password,
-    }
-
-    resp = session.post(LOGIN_URL, data=data, headers=HEADERS, allow_redirects=True)
-    if resp.status_code == 200 and "login" not in resp.url.lower():
-        return True
-
-    print(f"登入失敗 ({email}): status={resp.status_code}, url={resp.url}")
-    return False
+    resp = session.post(
+        LOGIN_URL,
+        data={"_token": token, "email": email, "password": password},
+        headers=HEADERS,
+        allow_redirects=True,
+    )
+    return resp.status_code == 200 and "login" not in resp.url.lower()
 
 
 def get_csrf_token(session):
@@ -594,13 +616,12 @@ def get_csrf_token(session):
 
 
 def get_member(session, phone, token, clean_type_id):
-    data = {
-        "phone": phone,
-        "_token": token,
-        "clean_type_id": clean_type_id,
-    }
-
-    resp = session.post(GET_MEMBER_URL, data=data, headers=HEADERS, allow_redirects=True)
+    resp = session.post(
+        GET_MEMBER_URL,
+        data={"phone": phone, "_token": token, "clean_type_id": clean_type_id},
+        headers=HEADERS,
+        allow_redirects=True,
+    )
     if resp.status_code != 200:
         return None
 
@@ -609,14 +630,16 @@ def get_member(session, phone, token, clean_type_id):
     except Exception:
         return None
 
-    if isinstance(result, dict) and result.get("return_code") == "0000" and result.get("member"):
-        return result
-
-    return None
+    return result if isinstance(result, dict) and result.get("return_code") == "0000" and result.get("member") else None
 
 
 def pick_best_address_info(member_payload, target_address):
+    """
+    新版補強：優先用 member.memberAddressList 的實際下拉地址資料
+    """
     member = member_payload.get("member", {}) if isinstance(member_payload, dict) else {}
+    purchase = member_payload.get("purchase", {}) if isinstance(member_payload, dict) else {}
+    address_list = member_payload.get("address", []) if isinstance(member_payload, dict) else []
     member_address_list = member.get("memberAddressList", []) if isinstance(member, dict) else []
 
     target_norm = normalize_addr_for_match(target_address)
@@ -624,7 +647,7 @@ def pick_best_address_info(member_payload, target_address):
     for item in member_address_list:
         item_addr = str(item.get("address", "")).strip()
         if normalize_addr_for_match(item_addr) == target_norm:
-            return {
+            result = {
                 "addressId": str(item.get("id", "")).strip(),
                 "country_id": item.get("countryId", ""),
                 "area_id": item.get("areaId", ""),
@@ -634,8 +657,51 @@ def pick_best_address_info(member_payload, target_address):
                 "company_id": item.get("companyId", 1),
                 "purchase": item.get("purchase", {}) if isinstance(item.get("purchase"), dict) else {},
             }
+            return result
 
-    return None
+    for item in address_list:
+        item_addr = str(item.get("address", "")).strip()
+        if normalize_addr_for_match(item_addr) == target_norm:
+            return {
+                "addressId": "",
+                "country_id": item.get("countryId", ""),
+                "area_id": item.get("areaId", ""),
+                "address": item_addr,
+                "lat": "",
+                "lng": "",
+                "company_id": 1,
+                "purchase": purchase if isinstance(purchase, dict) else {},
+            }
+
+    candidate_texts = []
+    for item in member_address_list:
+        addr = str(item.get("address", "")).strip()
+        if addr:
+            candidate_texts.append(addr)
+    for item in address_list:
+        addr = str(item.get("address", "")).strip()
+        if addr:
+            candidate_texts.append(addr)
+    candidate_texts = list(dict.fromkeys(candidate_texts))
+
+    if candidate_texts:
+        raise Exception("找不到完全相同地址。請確認地址是否一致。候選地址：" + "；".join(candidate_texts[:8]))
+
+    if isinstance(purchase, dict) and purchase:
+        purchase_addr = str(purchase.get("address", "")).strip()
+        if purchase_addr and normalize_addr_for_match(purchase_addr) == target_norm:
+            return {
+                "addressId": "",
+                "country_id": purchase.get("country_id", ""),
+                "area_id": purchase.get("area_id", ""),
+                "address": purchase_addr,
+                "lat": purchase.get("lat", ""),
+                "lng": purchase.get("lng", ""),
+                "company_id": purchase.get("company_id", 1),
+                "purchase": purchase,
+            }
+
+    return {}
 
 
 def geocode_address(address):
@@ -670,16 +736,19 @@ def geocode_address(address):
 
 
 def check_contain(session, member_id, address, lat, lng, token, clean_type_id):
-    data = {
-        "memberId": member_id,
-        "cleanTypeId": clean_type_id,
-        "address": address,
-        "lat": lat or "",
-        "lng": lng or "",
-        "_token": token,
-    }
-
-    resp = session.post(CHECK_CONTAIN_URL, data=data, headers=HEADERS, allow_redirects=True)
+    resp = session.post(
+        CHECK_CONTAIN_URL,
+        data={
+            "memberId": member_id,
+            "cleanTypeId": clean_type_id,
+            "address": address,
+            "lat": lat or "",
+            "lng": lng or "",
+            "_token": token,
+        },
+        headers=HEADERS,
+        allow_redirects=True,
+    )
     if resp.status_code != 200:
         return None
 
@@ -703,104 +772,36 @@ def calculate_hour(session, order_data, token):
         return None
 
 
-def extract_calc_fields(calc_result, fallback_hours=None, fallback_fare=None):
-    if not isinstance(calc_result, dict):
-        return {
-            "hour": str(fallback_hours or ""),
-            "price": "0",
-            "price_vvip": "0",
-            "fare": str(fallback_fare or "0"),
-        }
-
-    def pick(*keys, default=""):
-        for k in keys:
-            v = calc_result.get(k)
-            if v not in (None, ""):
-                return str(v)
-        return str(default)
-
-    return {
-        "hour": pick("hour", "clean_hour", default=fallback_hours or ""),
-        "price": pick("price", "total_price", "service_price", default="0"),
-        "price_vvip": pick("price_vvip", "vvip_price", default="0"),
-        "fare": pick("fare", "car_fare", default=fallback_fare or "0"),
-    }
-
-
 def get_section_raw(session, order_data, token, date_slot):
     data = order_data.copy()
     data["_token"] = token
     data["date_list[]"] = date_slot
 
     resp = session.post(GET_SECTION_URL, data=data, headers=HEADERS, allow_redirects=True)
-    if resp.status_code != 200:
-        return ""
-
-    return resp.text
+    return resp.text if resp.status_code == 200 else ""
 
 
-def extract_available_slots_from_section(raw_text):
+def slot_exists_in_section_response(raw_text, date_slot):
+    """
+    保留舊版穩定邏輯：直接在 raw response 搜日期 + 時段
+    """
     if not raw_text:
-        return []
+        return False
 
-    html = str(raw_text)
-    slots = []
-
-    # 抓 checkbox value
-    value_matches = re.findall(
-        r'value=["\'](\d{4}-\d{2}-\d{2}[_ ]\d{2}:\d{2}-\d{2}:\d{2})["\']',
-        html
-    )
-
-    for slot in value_matches:
-        slot = slot.replace(" ", "_")
-        if slot not in slots:
-            slots.append(slot)
-
-    # fallback
-    if not slots:
-        normalized = re.sub(r"\s+", "", html)
-        text_matches = re.findall(
-            r'(\d{4}-\d{2}-\d{2}).{0,20}?(\d{2}:\d{2}-\d{2}:\d{2})',
-            normalized
-        )
-        for d, p in text_matches:
-            slot = f"{d}_{p}"
-            if slot not in slots:
-                slots.append(slot)
-
-    return slots
-
-
-def slot_exists_in_section_response(raw_text, target_slot):
-    available_slots = extract_available_slots_from_section(raw_text)
-    return target_slot in available_slots
-
-
-def is_slot_match(target, candidate):
-    return target.replace(" ", "") in candidate.replace(" ", "")
+    date_part, period_part = date_slot.split("_", 1)
+    normalized = re.sub(r"\s+", "", raw_text)
+    pattern = re.escape(date_part) + r".*?" + re.escape(period_part)
+    return re.search(pattern, normalized) is not None
 
 
 def validate_available_slots(session, order_data, token, date_slots):
-    valid_slots = []
-    invalid_slots = []
-
+    valid_slots, invalid_slots = [], []
     for slot in date_slots:
         raw = get_section_raw(session, order_data, token, slot)
-        available_slots = extract_available_slots_from_section(raw)
-
-        ok = any(is_slot_match(slot, s) for s in available_slots)
-
-        print("[DEBUG] validate slot =", slot)
-        print("[DEBUG] available slots =", available_slots[:20])
-        print("[DEBUG] matched =", ok)
-
-        # 🔥 關鍵：只要有任何班就放行
-        if available_slots:
+        if slot_exists_in_section_response(raw, slot):
             valid_slots.append(slot)
         else:
             invalid_slots.append(slot)
-
     return valid_slots, invalid_slots
 
 
@@ -818,34 +819,28 @@ def extract_order_cards_from_purchase_html(html):
     for line in lines:
         if re.fullmatch(ORDER_NO_REGEX, line):
             if current:
-                current["joined_text"] = "\n".join(current["lines"])
                 blocks.append(current)
             current = {"order_no": line, "lines": [line]}
         elif current:
             current["lines"].append(line)
 
     if current:
-        current["joined_text"] = "\n".join(current["lines"])
         blocks.append(current)
 
     return blocks
 
 
 def match_order_from_purchase_page(html, target_date, target_period):
-    blocks = extract_order_cards_from_purchase_html(html)
-    for block in blocks:
-        joined = block.get("joined_text", "\n".join(block["lines"]))
-        normalized = normalize_text_for_parse(joined)
-        if target_date in normalized and normalize_text_for_parse(target_period) in normalized:
+    for block in extract_order_cards_from_purchase_html(html):
+        joined = "\n".join(block["lines"])
+        if target_date in joined and target_period in joined:
             return block["order_no"]
     return None
 
 
 def fetch_order_no_by_date_and_period(session, target_date, target_period):
     resp = session.get(PURCHASE_URL, headers=HEADERS, allow_redirects=True)
-    if resp.status_code != 200:
-        return None
-    return match_order_from_purchase_page(resp.text, target_date, target_period)
+    return None if resp.status_code != 200 else match_order_from_purchase_page(resp.text, target_date, target_period)
 
 
 def _extract_staff_line(lines):
@@ -876,9 +871,9 @@ def _extract_status_line(lines):
         if status in normalized:
             return status
 
-    if "未處理" in normalized or ("未" in normalized and "處" in normalized and "理" in normalized):
+    if "未處理" in normalized:
         return "未處理"
-    if "已處理" in normalized or ("已" in normalized and "處" in normalized and "理" in normalized):
+    if "已處理" in normalized:
         return "已處理"
 
     return "未處理"
@@ -905,10 +900,9 @@ def _extract_service_date_time(lines):
             service_date = text[:10]
 
             for j in range(idx + 1, min(idx + 5, len(lines))):
-                nxt = lines[j].strip()
-                nxt2 = nxt.replace(" ", "")
-                if re.match(r"\d{2}:\d{2}-\d{2}:\d{2}", nxt2):
-                    service_time = nxt2
+                nxt = lines[j].strip().replace(" ", "")
+                if re.match(r"\d{2}:\d{2}-\d{2}:\d{2}", nxt):
+                    service_time = nxt
                     break
             break
 
@@ -960,8 +954,7 @@ def send_confirmation_mail(session, order_no):
         return False, f"HTTP {resp.status_code}"
 
     try:
-        result = resp.json()
-        return True, str(result)
+        return True, str(resp.json())
     except Exception:
         return True, resp.text[:200]
 
@@ -1013,47 +1006,39 @@ def find_matching_calendar_event(service, calendar_id, address, target_date, sta
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
 
     tz = timezone(timedelta(hours=8))
-    day_start = datetime(
-        target_date_obj.year,
-        target_date_obj.month,
-        target_date_obj.day,
-        0, 0, 0,
-        tzinfo=tz,
-    )
+    day_start = datetime(target_date_obj.year, target_date_obj.month, target_date_obj.day, 0, 0, 0, tzinfo=tz)
     day_end = day_start + timedelta(days=1)
 
-    events_result = service.events().list(
+    events = service.events().list(
         calendarId=calendar_id,
         timeMin=day_start.isoformat(),
         timeMax=day_end.isoformat(),
         singleEvents=True,
         orderBy="startTime",
-    ).execute()
+    ).execute().get("items", [])
 
-    events = events_result.get("items", [])
     target_addr = normalize_addr_for_match(address)
 
     for event in events:
         start_raw = event.get("start", {}).get("dateTime") or event.get("start", {}).get("date")
         end_raw = event.get("end", {}).get("dateTime") or event.get("end", {}).get("date")
-
         start_dt = parse_event_time(start_raw)
         end_dt = parse_event_time(end_raw)
         if not start_dt or not end_dt:
             continue
 
-        same_date = start_dt.date() == target_date_obj.date()
-        same_start = (start_dt.hour, start_dt.minute) == (sh, sm)
-        same_end = (end_dt.hour, end_dt.minute) == (eh, em)
-
         location = event.get("location", "") or ""
         description = event.get("description", "") or ""
         summary = event.get("summary", "") or ""
-
         text_blob = normalize_addr_for_match(location + " " + description + " " + summary)
-        addr_match = target_addr and target_addr in text_blob
 
-        if same_date and same_start and same_end and addr_match:
+        if (
+            start_dt.date() == target_date_obj.date()
+            and (start_dt.hour, start_dt.minute) == (sh, sm)
+            and (end_dt.hour, end_dt.minute) == (eh, em)
+            and target_addr
+            and target_addr in text_blob
+        ):
             return event
 
     return None
@@ -1069,14 +1054,7 @@ def sync_calendar_color_for_row(service, calendar_id, address, date_value, start
         }
 
     try:
-        event = find_matching_calendar_event(
-            service=service,
-            calendar_id=calendar_id,
-            address=address,
-            target_date=date_value,
-            start_time_str=start_time_str,
-            end_time_str=end_time_str,
-        )
+        event = find_matching_calendar_event(service, calendar_id, address, date_value, start_time_str, end_time_str)
     except HttpError as e:
         return {
             "日曆改色結果": "失敗",
@@ -1144,16 +1122,7 @@ def sync_calendar_color_for_row(service, calendar_id, address, date_value, start
 # =========================
 # 各階段
 # =========================
-def prepare_base_order_data(
-    row,
-    member_payload,
-    address_info,
-    clean_type_id,
-    people,
-    hours,
-    system_period,
-    note_info,
-):
+def prepare_base_order_data(row, member_payload, address_info, clean_type_id, people, hours, system_period, note_info):
     member = member_payload.get("member", {}) if isinstance(member_payload, dict) else {}
     last_purchase = member_payload.get("lastPurchase", {}) if isinstance(member_payload, dict) else {}
     old_purchase = address_info.get("purchase", {}) if isinstance(address_info, dict) else {}
@@ -1167,14 +1136,14 @@ def prepare_base_order_data(
 
     base_memo = ""
     if note_info["need_note"]:
-        base_memo = note_info["customer_time_note"]
+        base_memo = note_info["customer_time_note"] if not base_memo else f"{base_memo}；{note_info['customer_time_note']}"
 
     return {
         "clean_type_id": clean_type_id,
         "phone": normalize_phone(row["電話"]),
         "name": str(member.get("name") or row["姓名"]).strip(),
         "email": str(member.get("email") or "").strip(),
-        "tel": str(member.get("tel") or ""),
+        "tel": str(member.get("tel") or normalize_phone(row["電話"])),
         "line": str(member.get("line") or ""),
         "fbName": str(member.get("fb_name") or ""),
         "fb": str(member.get("fb") or ""),
@@ -1182,7 +1151,7 @@ def prepare_base_order_data(
         "memoFinance": str(member.get("memo_finance") or ""),
         "addressId": str(address_info.get("addressId") or ""),
         "country_id": str(address_info.get("country_id") or pick("country_id", "12")),
-        "address": str(address_info.get("address") or row["地址"]).strip(),
+        "address": str(row["地址"]).strip(),
         "ping": str(pick("ping", "4")),
         "room": str(pick("room", "0")),
         "bathroom": str(pick("bathroom", "0")),
@@ -1200,15 +1169,15 @@ def prepare_base_order_data(
         "storage": str(pick("storage", "0")),
         "cabinet": str(pick("cabinet", "0")),
         "quintuple": str(pick("quintuple", "0")),
-        "hour": "",
-        "price": "",
-        "price_vvip": "",
+        "hour": str(int(float(hours))),
+        "price": "0",
+        "price_vvip": "0",
         "person": str(int(people)),
         "date_s": "",
         "period_s": system_period,
-        "cycle": "1",
-        "fare": "",
         "period": note_info["sms_time"] if note_info["need_note"] else "",
+        "cycle": "1",
+        "fare": str(address_info.get("fare") or pick("fare", "0") or "0"),
         "memo": base_memo,
         "notice": str(address_info.get("notice") or pick("notice", "")),
         "discount_code": "",
@@ -1222,19 +1191,24 @@ def prepare_base_order_data(
     }
 
 
+def filter_dates_by_balance(date_slots, date_prices, stored_value):
+    selected_slots, selected_prices, total = [], [], 0
+    for slot, price in zip(date_slots, date_prices):
+        if total + price <= stored_value:
+            selected_slots.append(slot)
+            selected_prices.append(price)
+            total += price
+    return selected_slots, selected_prices, total
+
+
 def stage_send_confirmation(order_no, session):
-    result = {"確認信": ""}
-
     if not order_no:
-        return result
-
+        return {"確認信": ""}
     try:
         ok, mail_msg = send_confirmation_mail(session, order_no)
-        result["確認信"] = "已發送" if ok else f"發送失敗: {mail_msg}"
+        return {"確認信": "已發送" if ok else f"發送失敗: {mail_msg}"}
     except Exception as e:
-        result["確認信"] = f"發送失敗: {e}"
-
-    return result
+        return {"確認信": f"發送失敗: {e}"}
 
 
 def stage_calendar_color(row, gcal_service, region):
@@ -1249,12 +1223,12 @@ def stage_calendar_color(row, gcal_service, region):
 
     try:
         return sync_calendar_color_for_row(
-            service=gcal_service,
-            calendar_id=calendar_id,
-            address=str(row["地址"]).strip(),
-            date_value=row["日期"],
-            start_time_str=str(row["開始時間"]).strip(),
-            end_time_str=str(row["結束時間"]).strip(),
+            gcal_service,
+            calendar_id,
+            str(row["地址"]).strip(),
+            row["日期"],
+            str(row["開始時間"]).strip(),
+            str(row["結束時間"]).strip(),
         )
     except Exception as e:
         return {
@@ -1266,29 +1240,11 @@ def stage_calendar_color(row, gcal_service, region):
 
 
 def stage_update_status(order_no, calendar_info):
-    if order_no and calendar_info.get("日曆改色結果") == "成功":
-        return {"狀態": "已安排"}
-    return {}
+    return {"狀態": "已安排"} if order_no and calendar_info.get("日曆改色結果") == "成功" else {}
 
 
 def has_action(selected_actions, action_name):
-    if not selected_actions:
-        return True
-    return action_name in selected_actions
-
-
-def filter_dates_by_balance(date_slots, date_prices, stored_value):
-    selected_slots = []
-    selected_prices = []
-    total = 0
-
-    for slot, price in zip(date_slots, date_prices):
-        if total + price <= stored_value:
-            selected_slots.append(slot)
-            selected_prices.append(price)
-            total += price
-
-    return selected_slots, selected_prices, total
+    return True if not selected_actions else action_name in selected_actions
 
 
 def process_existing_order_only(row, gcal_service, region, session, selected_actions=None):
@@ -1298,6 +1254,7 @@ def process_existing_order_only(row, gcal_service, region, session, selected_act
         return build_row_result(
             result="失敗",
             reason="無訂單編號",
+            status_value="",
             staff="無人力",
             service_status="未處理",
             fare="0",
@@ -1309,6 +1266,7 @@ def process_existing_order_only(row, gcal_service, region, session, selected_act
         order_no=order_no,
         result="跳過",
         reason="",
+        status_value="",
         staff=meta.get("服務人員", "無人力"),
         service_status=meta.get("服務狀態", "未處理"),
         fare=meta.get("車馬費", "0"),
@@ -1332,30 +1290,19 @@ def process_existing_order_only(row, gcal_service, region, session, selected_act
     return result
 
 
-def process_one_group(
-    session,
-    rows_with_idx,
-    token,
-    gcal_service,
-    region,
-    backend_user_id=None,
-    selected_actions=None,
-):
-    row_num0, row0 = rows_with_idx[0]
+def process_one_group(session, rows_with_idx, token, gcal_service, region, backend_user_id=None, selected_actions=None):
+    _, row0 = rows_with_idx[0]
 
     purchase_item = str(row0["購買項目"]).strip()
     clean_type_id = CLEAN_TYPE_MAP.get(purchase_item)
     if not clean_type_id:
         raise Exception(f"未知購買項目: {purchase_item}")
 
-    mapped = map_to_system_slot(row0["開始時間"], row0["結束時間"])
+    mapped = map_to_system_slot(row0["開始時間"], row0["結束時間"], row0["服務人時"])
     system_period = mapped["system_slot"]
+    system_display_period = display_period_text(system_period.split("-")[0], system_period.split("-")[1])
 
-    people, hours = parse_service_human_hour(
-        row0["服務人時"],
-        row0["開始時間"],
-        row0["結束時間"],
-    )
+    people, hours = parse_service_human_hour(row0["服務人時"], row0["開始時間"], row0["結束時間"])
     if hours is None:
         raise Exception("無法判斷服務時數")
 
@@ -1369,14 +1316,10 @@ def process_one_group(
 
     target_address = str(row0["地址"]).strip().split(",")[0]
     best_addr = pick_best_address_info(member_payload, target_address)
-    print("[DEBUG] best_addr =", best_addr)
-
     if not best_addr:
-        raise Exception(f"下拉選單找不到對應地址：{target_address}")
-    if not str(best_addr.get("addressId", "")).strip():
-        raise Exception(f"地址存在但缺少 addressId：{target_address}")
+        raise Exception("找不到對應地址資料")
 
-    selected_address = str(best_addr.get("address", "")).strip()
+    selected_address = str(best_addr.get("address") or target_address).strip()
 
     geo_lat, geo_lng = geocode_address(selected_address)
     if geo_lat and geo_lng:
@@ -1384,71 +1327,48 @@ def process_one_group(
         best_addr["lng"] = geo_lng
 
     addr_check = check_contain(
-        session=session,
-        member_id=member.get("member_id", ""),
-        address=selected_address,
-        lat=best_addr.get("lat", ""),
-        lng=best_addr.get("lng", ""),
-        token=token,
-        clean_type_id=clean_type_id,
+        session,
+        member.get("member_id", ""),
+        selected_address,
+        best_addr.get("lat", ""),
+        best_addr.get("lng", ""),
+        token,
+        clean_type_id,
     )
-    print("[DEBUG] addr_check =", addr_check)
 
-    if not addr_check:
-        raise Exception(f"查詢地區失敗：{selected_address}")
+    if addr_check and isinstance(addr_check.get("area"), dict):
+        best_addr["area_id"] = addr_check["area"].get("area_id", best_addr.get("area_id"))
+        best_addr["company_id"] = addr_check["area"].get("company_id", best_addr.get("company_id"))
+        best_addr["country_id"] = addr_check["area"].get("country_id", best_addr.get("country_id"))
 
-    area_data = addr_check.get("area", {}) if isinstance(addr_check.get("area"), dict) else {}
-    purchase_data = addr_check.get("purchase", {}) if isinstance(addr_check.get("purchase"), dict) else {}
-
-    best_addr["country_id"] = area_data.get("country_id", best_addr.get("country_id"))
-    best_addr["area_id"] = area_data.get("area_id", best_addr.get("area_id"))
-    best_addr["company_id"] = area_data.get("company_id", best_addr.get("company_id"))
-
-    if purchase_data:
-        best_addr["purchase"] = purchase_data
-
-    best_addr["fare"] = (
-        purchase_data.get("fare")
-        or purchase_data.get("car_fare")
-        or area_data.get("fare")
-        or "0"
-    )
-    best_addr["notice"] = (
-        purchase_data.get("notice")
-        or purchase_data.get("service_notice")
-        or area_data.get("notice")
-        or ""
-    )
+    if addr_check and isinstance(addr_check.get("purchase"), dict):
+        purchase_info = addr_check["purchase"]
+        best_addr["purchase"] = purchase_info
+        best_addr["fare"] = purchase_info.get("fare") or purchase_info.get("car_fare") or best_addr.get("fare", "0")
+        best_addr["notice"] = (
+            purchase_info.get("notice")
+            or purchase_info.get("service_notice")
+            or best_addr.get("notice", "")
+        )
 
     base_data = prepare_base_order_data(
-        row=row0,
-        member_payload=member_payload,
-        address_info=best_addr,
-        clean_type_id=clean_type_id,
-        people=people,
-        hours=hours,
-        system_period=system_period,
-        note_info=mapped,
+        row0,
+        member_payload,
+        best_addr,
+        clean_type_id,
+        people,
+        hours,
+        system_period,
+        mapped,
     )
 
-    calc_result = calculate_hour(session, base_data, token)
+    calc_date = get_date_str(row0["日期"])
+    calc_data = base_data.copy()
+    calc_data["date_s"] = calc_date
+
+    calc_result = calculate_hour(session, calc_data, token)
     if not calc_result:
         raise Exception("計算時數失敗")
-
-    calc_fields = extract_calc_fields(
-        calc_result=calc_result,
-        fallback_hours=int(float(hours)),
-        fallback_fare=best_addr.get("fare", "0"),
-    )
-
-    if calc_fields["hour"]:
-        base_data["hour"] = calc_fields["hour"]
-    if calc_fields["price"]:
-        base_data["price"] = calc_fields["price"]
-    if calc_fields["price_vvip"]:
-        base_data["price_vvip"] = calc_fields["price_vvip"]
-    if calc_fields["fare"] not in ("", None):
-        base_data["fare"] = calc_fields["fare"]
 
     def build_time_fields():
         sms_time = base_data.get("period", "")
@@ -1460,15 +1380,13 @@ def process_one_group(
 
     row_details = []
     for row_num, row in rows_with_idx:
-        target_slot = build_target_slot_from_row(row)
-        price = int(float(base_data.get("price") or 0))
-
+        date_s = get_date_str(row["日期"])
         row_details.append({
             "row_num": row_num,
-            "date": normalize_sheet_date(row["日期"]),
-            "slot": target_slot,
-            "price": price,
-            "display_period": normalize_sheet_period(row["開始時間"], row["結束時間"]),
+            "date": date_s,
+            "slot": f"{date_s}_{system_period}",
+            "price": calc_occurrence_price(row["日期"], people, hours),
+            "display_period": system_display_period,
             "row": row,
         })
 
@@ -1478,43 +1396,61 @@ def process_one_group(
     if not need_create_order:
         for detail in row_details:
             existing_order_no = str(detail["row"].get("訂單編號", "")).strip()
+            sms_time, customer_note = build_time_fields()
+
             meta = fetch_order_meta_by_order_no(session, existing_order_no) if existing_order_no else {
                 "服務人員": "無人力",
                 "服務狀態": "未處理",
                 "車馬費": "0",
             }
 
-            sms_time, customer_note = build_time_fields()
-
-            row_results[detail["row_num"]] = build_row_result(
+            result = build_row_result(
                 order_no=existing_order_no,
                 result="成功" if existing_order_no else "失敗",
-                reason="" if existing_order_no else "無訂單編號",
+                reason="" if existing_order_no else "無訂單編號，無法寄信或改日曆",
                 sms_time=sms_time,
                 customer_note=customer_note,
+                status_value="",
                 staff=meta.get("服務人員", "無人力"),
                 service_status=meta.get("服務狀態", "未處理"),
                 fare=meta.get("車馬費", "0"),
             )
+
+            if existing_order_no and has_action(selected_actions, "寄確認信"):
+                result.update(stage_send_confirmation(existing_order_no, session))
+
+            if has_action(selected_actions, "改 Google 日曆"):
+                calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
+                result.update(calendar_info)
+                if existing_order_no:
+                    result.update(stage_update_status(existing_order_no, calendar_info))
+
+            row_results[detail["row_num"]] = result
+
         return row_results
 
     raw_slots = [x["slot"] for x in row_details]
     valid_slots, invalid_slots = validate_available_slots(session, base_data, token, raw_slots)
 
-    valid_details = [d for d in row_details if d["slot"] in valid_slots]
+    no_slot_dates = []
+    valid_details = []
 
-    # 只要這批查班表有任何可用時段，就繼續送可送的資料；
-    # 完全沒有可用時段時，才整批判定不可送。
+    for detail in row_details:
+        if detail["slot"] in valid_slots:
+            valid_details.append(detail)
+        else:
+            no_slot_dates.append(detail["date"])
+
     if not valid_details:
-        sms_time, customer_note = build_time_fields()
-
         for detail in row_details:
+            sms_time, customer_note = build_time_fields()
             row_results[detail["row_num"]] = build_row_result(
                 result="失敗",
-                reason="查詢班表時沒有任何可用時段，依系統規範不可送出",
+                reason="無班表",
                 no_slot_date=detail["date"],
                 sms_time=sms_time,
                 customer_note=customer_note,
+                status_value="",
                 staff="無人力",
                 service_status="未處理",
                 fare="0",
@@ -1523,100 +1459,118 @@ def process_one_group(
 
     valid_slots_for_balance = [x["slot"] for x in valid_details]
     valid_prices_for_balance = [x["price"] for x in valid_details]
-    send_slots, _, _ = filter_dates_by_balance(
-        valid_slots_for_balance,
-        valid_prices_for_balance,
-        stored_value,
-    )
+    send_slots, send_prices, _ = filter_dates_by_balance(valid_slots_for_balance, valid_prices_for_balance, stored_value)
 
-    send_details = [d for d in valid_details if d["slot"] in send_slots]
-    no_balance_details = [d for d in valid_details if d["slot"] not in send_slots]
+    insufficient_dates = []
+    send_details = []
 
-    for detail in no_balance_details:
+    for detail in valid_details:
+        if detail["slot"] in send_slots:
+            send_details.append(detail)
+        else:
+            insufficient_dates.append(detail["date"])
+
+    for detail in row_details:
         sms_time, customer_note = build_time_fields()
 
-        row_results[detail["row_num"]] = build_row_result(
-            result="未送",
-            reason="餘額不足",
-            insufficient_date=detail["date"],
-            sms_time=sms_time,
-            customer_note=customer_note,
-            staff="無人力",
-            service_status="未處理",
-            fare=str(base_data.get("fare", "0")),
-        )
+        if detail["date"] in no_slot_dates:
+            row_results[detail["row_num"]] = build_row_result(
+                result="失敗",
+                reason="無班表",
+                no_slot_date=detail["date"],
+                sms_time=sms_time,
+                customer_note=customer_note,
+                status_value="",
+                staff="無人力",
+                service_status="未處理",
+                fare="0",
+            )
+        elif detail["date"] in insufficient_dates:
+            row_results[detail["row_num"]] = build_row_result(
+                result="未送",
+                reason="餘額不足",
+                insufficient_date=detail["date"],
+                sms_time=sms_time,
+                customer_note=customer_note,
+                status_value="",
+                staff="無人力",
+                service_status="未處理",
+                fare=str(base_data.get("fare", "0")),
+            )
 
     if not send_details:
         return row_results
 
+    batches = defaultdict(list)
     for detail in send_details:
+        batches[detail["price"]].append(detail)
+
+    for price, details in batches.items():
         payload = base_data.copy()
-        payload["price"] = str(detail["price"])
+        payload["price"] = str(price)
         payload["price_vvip"] = "0"
-        payload["fare"] = str(base_data.get("fare") or best_addr.get("fare") or "0")
-        payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
-        payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
-        payload["company_id"] = str(base_data.get("company_id") or best_addr.get("company_id") or "")
-        payload["addressId"] = str(base_data.get("addressId") or best_addr.get("addressId") or "")
+        payload["fare"] = str(base_data.get("fare") or "0")
+        payload["notice"] = str(base_data.get("notice") or "")
+        payload["area_id"] = str(base_data.get("area_id") or "")
+        payload["company_id"] = str(base_data.get("company_id") or "")
+        payload["addressId"] = str(base_data.get("addressId") or "")
+        payload["date_s"] = details[0]["date"]
 
-        target_slot = detail["slot"]
-
-        print("[DEBUG] final booking payload =", {
-            "row_num": detail["row_num"],
-            "target_slot": target_slot,
-            "addressId": payload.get("addressId"),
-            "fare": payload.get("fare"),
-            "notice": payload.get("notice"),
-            "area_id": payload.get("area_id"),
-            "company_id": payload.get("company_id"),
-        })
+        slots = [d["slot"] for d in details]
 
         session.post(
             BOOKING_URL,
-            data={**payload, "_token": token, "date_list[]": [target_slot]},
+            data={**payload, "_token": token, "date_list[]": slots},
             headers=HEADERS,
             allow_redirects=True,
         )
 
         time.sleep(1)
 
-        order_no = fetch_order_no_by_date_and_period(
-            session=session,
-            target_date=detail["date"],
-            target_period=detail["display_period"],
-        )
+        for detail in details:
+            order_no = fetch_order_no_by_date_and_period(session, detail["date"], detail["display_period"])
+            sms_time, customer_note = build_time_fields()
 
-        sms_time, customer_note = build_time_fields()
+            if not order_no:
+                row_results[detail["row_num"]] = build_row_result(
+                    result="已送出",
+                    reason="抓不到訂單編號",
+                    sms_time=sms_time,
+                    customer_note=customer_note,
+                    status_value="",
+                    staff="無人力",
+                    service_status="未處理",
+                    fare=str(base_data.get("fare", "0")),
+                )
+                continue
 
-        if not order_no:
+            meta = fetch_order_meta_by_order_no(session, order_no)
+
             stage_result = build_row_result(
-                result="失敗",
-                reason=f"送單後抓不到訂單編號（目標時段：{target_slot}）",
+                order_no=order_no,
+                result="成功",
+                reason="",
                 sms_time=sms_time,
                 customer_note=customer_note,
-                staff="無人力",
-                service_status="未處理",
-                fare=str(base_data.get("fare", "0")),
+                status_value="",
+                staff=meta.get("服務人員", "無人力"),
+                service_status=meta.get("服務狀態", "未處理"),
+                fare=meta.get("車馬費", "0") or str(base_data.get("fare", "0")),
             )
+
+            if has_action(selected_actions, "寄確認信"):
+                stage_result.update(stage_send_confirmation(order_no, session))
+
+            if has_action(selected_actions, "改 Google 日曆"):
+                calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
+                stage_result.update(calendar_info)
+                stage_result.update(stage_update_status(order_no, calendar_info))
+
             row_results[detail["row_num"]] = stage_result
-            continue
-
-        meta = fetch_order_meta_by_order_no(session, order_no)
-
-        stage_result = build_row_result(
-            order_no=order_no,
-            result="成功",
-            reason="",
-            sms_time=sms_time,
-            customer_note=customer_note,
-            staff=meta.get("服務人員", "無人力"),
-            service_status=meta.get("服務狀態", "未處理"),
-            fare=meta.get("車馬費", "0") or str(base_data.get("fare", "0")),
-        )
-
-        row_results[detail["row_num"]] = stage_result
 
     return row_results
+
+
 # =========================
 # 主執行
 # =========================
@@ -1701,13 +1655,13 @@ def run_process(sheet_name, start_row, end_row, env_name_from_ui=None):
             try:
                 token = get_csrf_token(session)
                 row_results = process_one_group(
-                    session=session,
-                    rows_with_idx=rows_with_idx,
-                    token=token,
-                    gcal_service=gcal_service,
-                    region=region,
-                    backend_user_id=None,
-                    selected_actions=["建單", "寄確認信", "改 Google 日曆"],
+                    session,
+                    rows_with_idx,
+                    token,
+                    gcal_service,
+                    region,
+                    None,
+                    ["建單", "寄確認信", "改 Google 日曆"],
                 )
                 all_row_results.update(row_results)
             except Exception as e:
@@ -1716,16 +1670,13 @@ def run_process(sheet_name, start_row, end_row, env_name_from_ui=None):
                     all_row_results[row_num] = build_row_result(
                         result="失敗",
                         reason=str(e),
+                        status_value="",
                         staff="無人力",
                         service_status="未處理",
                         fare="0",
                     )
 
             time.sleep(REQUEST_DELAY)
-
-    print("[DEBUG] row_results keys =", list(all_row_results.keys()))
-    for row_num, info in all_row_results.items():
-        print("[DEBUG] final row", row_num, info.get("服務人員"), info.get("服務狀態"), info.get("車馬費"))
 
     update_sheet_rows(ws, all_row_results)
     print("已回填 Google Sheet。")
@@ -1743,19 +1694,7 @@ def get_runtime_config(env_name: str):
     }
 
 
-def run_process_web(
-    env_name,
-    region,
-    backend_email,
-    backend_password,
-    sheet_name,
-    start_row,
-    end_row,
-    selected_actions=None,
-    logger=print,
-):
-    logger("=== run_process_web 已進入：2026-04-23-final-v5 ===")
-
+def run_process_web(env_name, region, backend_email, backend_password, sheet_name, start_row, end_row, selected_actions=None, logger=print):
     global BASE_URL, ORDER_PREFIX
     if env_name == "dev":
         BASE_URL = BASE_URL_DEV
@@ -1809,17 +1748,20 @@ def run_process_web(
 
     if df.empty:
         logger("沒有符合條件的資料可執行。")
-        return {"success": True, "message": "沒有符合條件的資料"}
+        return {
+            "success": True,
+            "message": "沒有符合條件的資料",
+            "failed_records": [],
+        }
 
-    filtered_rows = []
-    for _, row in df.iterrows():
-        row_region = get_region_by_address(str(row["地址"]), ACCOUNTS)
-        if row_region == region:
-            filtered_rows.append(row)
-
+    filtered_rows = [row for _, row in df.iterrows() if get_region_by_address(str(row["地址"]), ACCOUNTS) == region]
     if not filtered_rows:
         logger(f"沒有 {region} 區域的資料可執行。")
-        return {"success": True, "message": f"沒有 {region} 區域資料"}
+        return {
+            "success": True,
+            "message": f"沒有 {region} 區域資料",
+            "failed_records": [],
+        }
 
     df = pd.DataFrame(filtered_rows)
     if "__sheet_row__" not in df.columns:
@@ -1835,8 +1777,7 @@ def run_process_web(
             gcal_service = None
 
     session = requests.Session()
-    login_ok = login(session, backend_email, backend_password)
-    if not login_ok:
+    if not login(session, backend_email, backend_password):
         raise Exception("後台登入失敗，請確認帳號密碼")
 
     grouped_orders = defaultdict(list)
@@ -1845,37 +1786,39 @@ def run_process_web(
     for _, row in df.iterrows():
         row_num = int(row["__sheet_row__"])
 
-        if not has_action(selected_actions, "建單"):
+        if not has_action(selected_actions, "建單") or not should_create_order(row):
             existing_order_rows.append((row_num, row))
             continue
 
-        if not should_create_order(row):
-            existing_order_rows.append((row_num, row))
-            continue
-
-        key = build_group_key(row)
-        grouped_orders[key].append((row_num, row))
+        grouped_orders[build_group_key(row)].append((row_num, row))
 
     all_row_results = {}
+    failed_records = []
 
     for row_num, row in existing_order_rows:
         try:
-            result = process_existing_order_only(
-                row=row,
-                gcal_service=gcal_service,
-                region=region,
-                session=session,
-                selected_actions=selected_actions,
-            )
+            result = process_existing_order_only(row, gcal_service, region, session, selected_actions)
             all_row_results[row_num] = result
+            if result.get("結果") == "失敗":
+                failed_records.append({
+                    "row": row_num,
+                    "name": str(row.get("姓名", "未知")).strip(),
+                    "error": str(result.get("原因", "")),
+                })
         except Exception as e:
             all_row_results[row_num] = build_row_result(
                 result="失敗",
                 reason=f"補處理失敗: {e}",
+                status_value="",
                 staff="無人力",
                 service_status="未處理",
                 fare="0",
             )
+            failed_records.append({
+                "row": row_num,
+                "name": str(row.get("姓名", "未知")).strip(),
+                "error": f"補處理失敗: {e}",
+            })
 
     for group_no, (_, rows_with_idx) in enumerate(grouped_orders.items(), start=1):
         _, first_row = rows_with_idx[0]
@@ -1883,32 +1826,35 @@ def run_process_web(
 
         try:
             token = get_csrf_token(session)
-            row_results = process_one_group(
-                session=session,
-                rows_with_idx=rows_with_idx,
-                token=token,
-                gcal_service=gcal_service,
-                region=region,
-                backend_user_id=None,
-                selected_actions=selected_actions,
-            )
+            row_results = process_one_group(session, rows_with_idx, token, gcal_service, region, None, selected_actions)
             all_row_results.update(row_results)
+
+            for row_num, row in rows_with_idx:
+                result = row_results.get(row_num, {})
+                if result.get("結果") == "失敗":
+                    failed_records.append({
+                        "row": row_num,
+                        "name": str(row.get("姓名", "未知")).strip(),
+                        "error": str(result.get("原因", "")),
+                    })
         except Exception as e:
             logger(f"整組失敗：{e}")
-            for row_num, _ in rows_with_idx:
+            for row_num, row in rows_with_idx:
+                failed_records.append({
+                    "row": row_num,
+                    "name": str(row.get("姓名", "未知")).strip(),
+                    "error": str(e),
+                })
                 all_row_results[row_num] = build_row_result(
                     result="失敗",
                     reason=str(e),
+                    status_value="",
                     staff="無人力",
                     service_status="未處理",
                     fare="0",
                 )
 
         time.sleep(REQUEST_DELAY)
-
-    logger(f"[DEBUG] row_results keys = {list(all_row_results.keys())}")
-    for row_num, info in all_row_results.items():
-        logger(f"[DEBUG] write row {row_num} {info.get('服務人員')} {info.get('服務狀態')} {info.get('車馬費')}")
 
     update_sheet_rows(ws, all_row_results)
     logger("已回填 Google Sheet。")
@@ -1924,4 +1870,5 @@ def run_process_web(
         "success_count": success_count,
         "fail_count": fail_count,
         "total_processed": len(all_row_results),
+        "failed_records": failed_records,
     }
