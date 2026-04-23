@@ -1572,17 +1572,24 @@ def process_one_group(
             target_period=detail["display_period"],
         )
 
+        # 🔥 關鍵修正：統一時間來源
+        sms_time = base_data.get("period", "")
+        customer_note = base_data.get("memo", "")
+
+        if mapped["need_note"]:
+            sms_time = mapped["original_slot"]
+            customer_note = f"服務時間：{mapped['original_slot']}"
+
         if not order_no:
             stage_result = build_row_result(
                 result="失敗",
                 reason=f"送單後抓不到訂單編號（目標時段：{target_slot}）",
-                sms_time=base_data.get("period", ""),
-                customer_note=base_data.get("memo", ""),
+                sms_time=sms_time,
+                customer_note=customer_note,
                 staff="無人力",
                 service_status="未處理",
                 fare=str(base_data.get("fare", "0")),
             )
-            print("[DEBUG] stage_result =", stage_result)
             row_results[detail["row_num"]] = stage_result
             continue
 
@@ -1592,26 +1599,16 @@ def process_one_group(
             order_no=order_no,
             result="成功",
             reason="",
-            sms_time=base_data.get("period", ""),
-            customer_note=base_data.get("memo", ""),
+            sms_time=sms_time,
+            customer_note=customer_note,
             staff=meta.get("服務人員", "無人力"),
             service_status=meta.get("服務狀態", "未處理"),
             fare=meta.get("車馬費", "0") or str(base_data.get("fare", "0")),
         )
 
-        if has_action(selected_actions, "寄確認信"):
-            stage_result.update(stage_send_confirmation(order_no, session))
-
-        if has_action(selected_actions, "改 Google 日曆"):
-            calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
-            stage_result.update(calendar_info)
-            stage_result.update(stage_update_status(order_no, calendar_info))
-
-        print("[DEBUG] stage_result =", stage_result)
         row_results[detail["row_num"]] = stage_result
 
     return row_results
-
 
 # =========================
 # 主執行
