@@ -96,7 +96,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-23-final-v3 ===")
+print("=== 儲值金系統設定.py 版本：2026-04-23-final-v4 ===")
 
 
 # =========================
@@ -137,7 +137,7 @@ def parse_date_value(date_value):
     raise Exception(f"無法解析日期: {date_value}")
 
 
-def get_date_str(date_value):
+def normalize_sheet_date(date_value):
     return parse_date_value(date_value).strftime("%Y-%m-%d")
 
 
@@ -154,11 +154,33 @@ def parse_time_slot(start_time_str, end_time_str):
 
 
 def calc_hours_from_time(start_time_str, end_time_str):
+    """
+    計算服務時數：
+    - 一般直接用結束時間 - 開始時間
+    - 若跨過中午休息時段 12:00~13:00，扣 1 小時
+
+    例：
+    10:00-12:00 -> 2 小時
+    09:00-16:00 -> 7 - 1 = 6 小時
+    09:00-18:00 -> 9 - 1 = 8 小時
+    """
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
-    hours = (eh - sh) + (em - sm) / 60.0
-    if hours <= 0:
+
+    start_minutes = sh * 60 + sm
+    end_minutes = eh * 60 + em
+
+    total_hours = (end_minutes - start_minutes) / 60.0
+    if total_hours <= 0:
         return None
-    return hours
+
+    lunch_start = 12 * 60
+    lunch_end = 13 * 60
+
+    crosses_lunch = start_minutes < lunch_start and end_minutes > lunch_end
+    if crosses_lunch:
+        total_hours -= 1
+
+    return total_hours
 
 
 def normalize_period_text(start_time_str, end_time_str):
@@ -169,6 +191,16 @@ def normalize_period_text(start_time_str, end_time_str):
 def display_period_text(start_time_str, end_time_str):
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
     return f"{sh:02d}:{sm:02d} - {eh:02d}:{em:02d}"
+
+
+def normalize_sheet_period(start_time_str, end_time_str):
+    return normalize_period_text(start_time_str, end_time_str)
+
+
+def build_target_slot_from_row(row):
+    date_part = normalize_sheet_date(row["日期"])
+    period_part = normalize_sheet_period(row["開始時間"], row["結束時間"])
+    return f"{date_part}_{period_part}"
 
 
 def slot_duration_hours(slot_text):
@@ -566,14 +598,9 @@ def get_member(session, phone, token, clean_type_id):
         return None
 
     try:
-        result = resp.json()
+        return resp.json()
     except Exception:
         return None
-
-    if isinstance(result, dict) and result.get("return_code") == "0000" and result.get("member"):
-        return result
-
-    return None
 
 
 def pick_best_address_info(member_payload, target_address):
@@ -700,30 +727,32 @@ def get_section_raw(session, order_data, token, date_slot):
     return resp.text
 
 
-def slot_exists_in_section_response(raw_text, date_slot):
+def extract_available_slots_from_section(raw_text):
     """
-    支援畫面格式：
-    2026-05-12 (二) 08:30-12:30(...)
+    從 get_section 回傳內容抓所有可選班表時段
+    轉成 ['2026-05-12_08:30-12:30', ...]
     """
     if not raw_text:
-        return False
+        return []
 
-    try:
-        date_part, period_part = str(date_slot).split("_", 1)
-    except ValueError:
-        return False
+    text = str(raw_text)
+    normalized = re.sub(r"\s+", "", text)
 
-    normalized = normalize_text_for_parse(raw_text)
-    date_part = date_part.strip()
-    period_part = period_part.strip()
+    pattern = r'(\d{4}-\d{2}-\d{2}).{0,12}?(\d{2}:\d{2}-\d{2}:\d{2})'
+    matches = re.findall(pattern, normalized)
 
-    if date_part not in normalized:
-        return False
-    if period_part not in normalized:
-        return False
+    slots = []
+    for date_part, period_part in matches:
+        slot = f"{date_part}_{period_part}"
+        if slot not in slots:
+            slots.append(slot)
 
-    pattern = re.escape(date_part) + r".{0,12}?" + re.escape(period_part)
-    return re.search(pattern, normalized) is not None
+    return slots
+
+
+def slot_exists_in_section_response(raw_text, target_slot):
+    available_slots = extract_available_slots_from_section(raw_text)
+    return target_slot in available_slots
 
 
 def validate_available_slots(session, order_data, token, date_slots):
@@ -732,10 +761,11 @@ def validate_available_slots(session, order_data, token, date_slots):
 
     for slot in date_slots:
         raw = get_section_raw(session, order_data, token, slot)
-        ok = slot_exists_in_section_response(raw, slot)
+        available_slots = extract_available_slots_from_section(raw)
+        ok = slot in available_slots
 
         print("[DEBUG] validate slot =", slot)
-        print("[DEBUG] raw snippet =", str(raw)[:500])
+        print("[DEBUG] available slots =", available_slots[:20])
         print("[DEBUG] matched =", ok)
 
         if ok:
@@ -1292,10 +1322,6 @@ def process_one_group(
 
     mapped = map_to_system_slot(row0["開始時間"], row0["結束時間"])
     system_period = mapped["system_slot"]
-    system_display_period = display_period_text(
-        system_period.split("-")[0],
-        system_period.split("-")[1],
-    ).replace(" ", "")
 
     people, hours = parse_service_human_hour(
         row0["服務人時"],
@@ -1401,16 +1427,15 @@ def process_one_group(
 
     row_details = []
     for row_num, row in rows_with_idx:
-        date_s = get_date_str(row["日期"])
-        slot = f"{date_s}_{system_period}"
+        target_slot = build_target_slot_from_row(row)
         price = int(float(base_data.get("price") or 0))
 
         row_details.append({
             "row_num": row_num,
-            "date": date_s,
-            "slot": slot,
+            "date": normalize_sheet_date(row["日期"]),
+            "slot": target_slot,
             "price": price,
-            "display_period": system_display_period,
+            "display_period": normalize_sheet_period(row["開始時間"], row["結束時間"]),
             "row": row,
         })
 
@@ -1438,7 +1463,6 @@ def process_one_group(
             )
         return row_results
 
-    # 4. 非表單原時段不可送單
     raw_slots = [x["slot"] for x in row_details]
     valid_slots, invalid_slots = validate_available_slots(session, base_data, token, raw_slots)
 
@@ -1486,7 +1510,7 @@ def process_one_group(
     if not send_details:
         return row_results
 
-    # 5. 每一列各自送單，避免日期混掉
+    # 每一列各自送單
     for detail in send_details:
         payload = base_data.copy()
         payload["price"] = str(detail["price"])
@@ -1521,7 +1545,7 @@ def process_one_group(
         order_no = fetch_order_no_by_date_and_period(
             session=session,
             target_date=detail["date"],
-            target_period=detail["display_period"].replace(" ", ""),
+            target_period=detail["display_period"],
         )
 
         if not order_no:
@@ -1702,7 +1726,7 @@ def run_process_web(
     selected_actions=None,
     logger=print,
 ):
-    logger("=== run_process_web 已進入：2026-04-23-final-v3 ===")
+    logger("=== run_process_web 已進入：2026-04-23-final-v4 ===")
 
     global BASE_URL, ORDER_PREFIX
     if env_name == "dev":
