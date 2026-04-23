@@ -215,16 +215,23 @@ def is_morning_slot(slot_text):
 
 
 def map_to_system_slot(start_time_str, end_time_str):
-    """
-    將表單時段映射到系統 period_s。
-    若本身就是系統可選時段，直接用。
-    否則用「早/午 + 扣午休後時數」找對應系統時段。
-    """
     original_slot = normalize_period_text(start_time_str, end_time_str)
     actual_hours = calc_hours_from_time(start_time_str, end_time_str)
+
     if actual_hours is None:
         raise Exception(f"無法解析服務時段: {start_time_str}-{end_time_str}")
 
+    # 🔥 強制規則：10-12 → 09-11
+    if original_slot == "10:00-12:00":
+        return {
+            "original_slot": original_slot,
+            "system_slot": "09:00-11:00",
+            "need_note": True,
+            "sms_time": original_slot,
+            "customer_time_note": f"服務時間：{original_slot}",
+        }
+
+    # 標準時段
     if original_slot in STANDARD_SLOTS:
         return {
             "original_slot": original_slot,
@@ -234,26 +241,17 @@ def map_to_system_slot(start_time_str, end_time_str):
             "customer_time_note": "",
         }
 
+    # 非標準 → 找最接近
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
-    original_is_morning = sh < 12 and eh <= 13
 
     matched_slot = None
     for slot in STANDARD_SLOTS:
-        same_period = is_morning_slot(slot) == is_morning_slot(f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}")
-        same_hours = abs(slot_duration_hours(slot) - actual_hours) < 1e-9
-        if same_period and same_hours:
+        if abs(slot_duration_hours(slot) - actual_hours) < 1e-9:
             matched_slot = slot
             break
 
     if not matched_slot:
-        # 若無完全對應，就保留原始時段供備註，period_s 仍用最接近的上午/下午固定時段
-        for slot in STANDARD_SLOTS:
-            if abs(slot_duration_hours(slot) - actual_hours) < 1e-9:
-                matched_slot = slot
-                break
-
-    if not matched_slot:
-        raise Exception(f"找不到可對應的系統時段：原始時段 {original_slot}，時數 {actual_hours}")
+        raise Exception(f"找不到可對應的系統時段：{original_slot}")
 
     return {
         "original_slot": original_slot,
