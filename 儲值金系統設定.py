@@ -96,7 +96,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-23-final-v4 ===")
+print("=== 儲值金系統設定.py 版本：2026-04-23-final-v5 ===")
 
 
 # =========================
@@ -155,14 +155,11 @@ def parse_time_slot(start_time_str, end_time_str):
 
 def calc_hours_from_time(start_time_str, end_time_str):
     """
-    計算服務時數：
-    - 一般直接用結束時間 - 開始時間
-    - 若跨過中午休息時段 12:00~13:00，扣 1 小時
-
-    例：
+    規則：
     10:00-12:00 -> 2 小時
     09:00-16:00 -> 7 - 1 = 6 小時
     09:00-18:00 -> 9 - 1 = 8 小時
+    只要跨過 12:00~13:00 午休就扣 1 小時
     """
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
 
@@ -218,6 +215,11 @@ def is_morning_slot(slot_text):
 
 
 def map_to_system_slot(start_time_str, end_time_str):
+    """
+    將表單時段映射到系統 period_s。
+    若本身就是系統可選時段，直接用。
+    否則用「早/午 + 扣午休後時數」找對應系統時段。
+    """
     original_slot = normalize_period_text(start_time_str, end_time_str)
     actual_hours = calc_hours_from_time(start_time_str, end_time_str)
     if actual_hours is None:
@@ -233,15 +235,22 @@ def map_to_system_slot(start_time_str, end_time_str):
         }
 
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
-    original_is_morning = sh < 12
+    original_is_morning = sh < 12 and eh <= 13
 
     matched_slot = None
     for slot in STANDARD_SLOTS:
-        same_period = is_morning_slot(slot) == original_is_morning
+        same_period = is_morning_slot(slot) == is_morning_slot(f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}")
         same_hours = abs(slot_duration_hours(slot) - actual_hours) < 1e-9
         if same_period and same_hours:
             matched_slot = slot
             break
+
+    if not matched_slot:
+        # 若無完全對應，就保留原始時段供備註，period_s 仍用最接近的上午/下午固定時段
+        for slot in STANDARD_SLOTS:
+            if abs(slot_duration_hours(slot) - actual_hours) < 1e-9:
+                matched_slot = slot
+                break
 
     if not matched_slot:
         raise Exception(f"找不到可對應的系統時段：原始時段 {original_slot}，時數 {actual_hours}")
@@ -598,9 +607,14 @@ def get_member(session, phone, token, clean_type_id):
         return None
 
     try:
-        return resp.json()
+        result = resp.json()
     except Exception:
         return None
+
+    if isinstance(result, dict) and result.get("return_code") == "0000" and result.get("member"):
+        return result
+
+    return None
 
 
 def pick_best_address_info(member_payload, target_address):
@@ -729,20 +743,33 @@ def get_section_raw(session, order_data, token, date_slot):
 
 def extract_available_slots_from_section(raw_text):
     """
-    從 get_section 回傳內容抓所有可選班表時段
-    轉成 ['2026-05-12_08:30-12:30', ...]
+    優先抓 checkbox value：
+    value="2026-05-12_08:30-12:30"
+    抓不到時才退回畫面文字解析。
     """
     if not raw_text:
         return []
 
-    text = str(raw_text)
-    normalized = re.sub(r"\s+", "", text)
-
-    pattern = r'(\d{4}-\d{2}-\d{2}).{0,12}?(\d{2}:\d{2}-\d{2}:\d{2})'
-    matches = re.findall(pattern, normalized)
-
+    html = str(raw_text)
     slots = []
-    for date_part, period_part in matches:
+
+    value_matches = re.findall(
+        r'value=["\'](\d{4}-\d{2}-\d{2}_\d{2}:\d{2}-\d{2}:\d{2})["\']',
+        html
+    )
+    for slot in value_matches:
+        if slot not in slots:
+            slots.append(slot)
+
+    if slots:
+        return slots
+
+    normalized = re.sub(r"\s+", "", html)
+    text_matches = re.findall(
+        r'(\d{4}-\d{2}-\d{2}).{0,12}?(\d{2}:\d{2}-\d{2}:\d{2})',
+        normalized
+    )
+    for date_part, period_part in text_matches:
         slot = f"{date_part}_{period_part}"
         if slot not in slots:
             slots.append(slot)
@@ -767,6 +794,7 @@ def validate_available_slots(session, order_data, token, date_slots):
         print("[DEBUG] validate slot =", slot)
         print("[DEBUG] available slots =", available_slots[:20])
         print("[DEBUG] matched =", ok)
+        print("[DEBUG] raw snippet =", str(raw)[:1000])
 
         if ok:
             valid_slots.append(slot)
@@ -1339,7 +1367,6 @@ def process_one_group(
     member = member_payload.get("member", {})
     stored_value = int(float(member_payload.get("storedValue", 0) or 0))
 
-    # 1. 一定走既有地址下拉
     target_address = str(row0["地址"]).strip().split(",")[0]
     best_addr = pick_best_address_info(member_payload, target_address)
     print("[DEBUG] best_addr =", best_addr)
@@ -1351,13 +1378,11 @@ def process_one_group(
 
     selected_address = str(best_addr.get("address", "")).strip()
 
-    # 2. geocode
     geo_lat, geo_lng = geocode_address(selected_address)
     if geo_lat and geo_lng:
         best_addr["lat"] = geo_lat
         best_addr["lng"] = geo_lng
 
-    # 3. 一定做查詢地址 / 查詢地區
     addr_check = check_contain(
         session=session,
         member_id=member.get("member_id", ""),
@@ -1510,7 +1535,6 @@ def process_one_group(
     if not send_details:
         return row_results
 
-    # 每一列各自送單
     for detail in send_details:
         payload = base_data.copy()
         payload["price"] = str(detail["price"])
@@ -1726,7 +1750,7 @@ def run_process_web(
     selected_actions=None,
     logger=print,
 ):
-    logger("=== run_process_web 已進入：2026-04-23-final-v4 ===")
+    logger("=== run_process_web 已進入：2026-04-23-final-v5 ===")
 
     global BASE_URL, ORDER_PREFIX
     if env_name == "dev":
