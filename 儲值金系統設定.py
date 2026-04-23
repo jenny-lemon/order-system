@@ -1492,22 +1492,29 @@ def process_one_group(
     valid_slots, invalid_slots = validate_available_slots(session, base_data, token, raw_slots)
 
     valid_details = [d for d in row_details if d["slot"] in valid_slots]
-    invalid_details = [d for d in row_details if d["slot"] in invalid_slots]
 
-    for detail in invalid_details:
-        row_results[detail["row_num"]] = build_row_result(
-            result="失敗",
-            reason="查詢班表時沒有相應時段資料，依系統規範不可送出",
-            no_slot_date=detail["date"],
-            sms_time=base_data.get("period", ""),
-            customer_note=base_data.get("memo", ""),
-            staff="無人力",
-            service_status="未處理",
-            fare="0",
-        )
-
+    # 🔥 如果 validate 有回任何可送時段，就只處理可送的
+    # 不再因為 slot 格式差異，把同批其他資料誤判成「不可送」
     if not valid_details:
-        return row_results
+        sms_time = base_data.get("period", "")
+        customer_note = base_data.get("memo", "")
+
+        if mapped["need_note"]:
+            sms_time = mapped["original_slot"]
+            customer_note = f"服務時間：{mapped['original_slot']}"
+
+        for detail in row_details:
+            row_results[detail["row_num"]] = build_row_result(
+                result="失敗",
+                reason="查詢班表時沒有任何可用時段，依系統規範不可送出",
+                no_slot_date=detail["date"],
+                sms_time=sms_time,
+                customer_note=customer_note,
+                staff="無人力",
+                service_status="未處理",
+                fare="0",
+            )
+        return row_results    
 
     valid_slots_for_balance = [x["slot"] for x in valid_details]
     valid_prices_for_balance = [x["price"] for x in valid_details]
