@@ -1509,7 +1509,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         payload = base_data.copy()
         payload["price"] = str(price)
         payload["price_vvip"] = "0"
-        payload["fare"] = str(base_data.get("fare") or "0")
+        payload["fare"] = str(base_data.get("fare") or best_addr.get("fare") or "0")
         payload["notice"] = str(base_data.get("notice") or "")
         payload["area_id"] = str(base_data.get("area_id") or "")
         payload["company_id"] = str(base_data.get("company_id") or "")
