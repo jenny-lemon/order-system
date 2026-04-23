@@ -740,37 +740,34 @@ def get_section_raw(session, order_data, token, date_slot):
 
 
 def extract_available_slots_from_section(raw_text):
-    """
-    優先抓 checkbox value：
-    value="2026-05-12_08:30-12:30"
-    抓不到時才退回畫面文字解析。
-    """
     if not raw_text:
         return []
 
     html = str(raw_text)
     slots = []
 
+    # 抓 checkbox value
     value_matches = re.findall(
-        r'value=["\'](\d{4}-\d{2}-\d{2}_\d{2}:\d{2}-\d{2}:\d{2})["\']',
+        r'value=["\'](\d{4}-\d{2}-\d{2}[_ ]\d{2}:\d{2}-\d{2}:\d{2})["\']',
         html
     )
+
     for slot in value_matches:
+        slot = slot.replace(" ", "_")
         if slot not in slots:
             slots.append(slot)
 
-    if slots:
-        return slots
-
-    normalized = re.sub(r"\s+", "", html)
-    text_matches = re.findall(
-        r'(\d{4}-\d{2}-\d{2}).{0,12}?(\d{2}:\d{2}-\d{2}:\d{2})',
-        normalized
-    )
-    for date_part, period_part in text_matches:
-        slot = f"{date_part}_{period_part}"
-        if slot not in slots:
-            slots.append(slot)
+    # fallback
+    if not slots:
+        normalized = re.sub(r"\s+", "", html)
+        text_matches = re.findall(
+            r'(\d{4}-\d{2}-\d{2}).{0,20}?(\d{2}:\d{2}-\d{2}:\d{2})',
+            normalized
+        )
+        for d, p in text_matches:
+            slot = f"{d}_{p}"
+            if slot not in slots:
+                slots.append(slot)
 
     return slots
 
