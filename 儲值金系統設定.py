@@ -76,7 +76,7 @@ CLEAN_TYPE_MAP = {
 
 ORDER_NO_REGEX = r"(LC|TT)\d+"
 
-# 以舊版穩定送單邏輯為底：保留 09-16 / 09-18
+# 保留舊版可穩定比對班表的系統時段
 STANDARD_SLOTS = [
     "08:30-12:30",
     "09:00-11:00",
@@ -97,7 +97,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-23-old-base-address-checkcontain-xyz-final ===")
+print("=== 儲值金系統設定.py 版本：2026-04-23-final-full ===")
 
 
 # =========================
@@ -224,12 +224,6 @@ def is_morning_slot(slot_text):
 
 
 def map_to_system_slot(start_time_str, end_time_str, service_text=None):
-    """
-    以舊版穩定邏輯為主：
-    - 先看服務人時欄位的小時數
-    - 找對應 system_slot
-    - 非標準時段要留下原始時間給簡訊/客備
-    """
     original_slot = normalize_period_text(start_time_str, end_time_str)
     actual_hours = None
 
@@ -248,7 +242,7 @@ def map_to_system_slot(start_time_str, end_time_str, service_text=None):
     if actual_hours is None:
         raise Exception(f"無法解析服務時段: {start_time_str}-{end_time_str}")
 
-    # 強制規則：10-12 送 09-11，但保留原始時間做備註
+    # 特殊規則
     if original_slot == "10:00-12:00":
         return {
             "original_slot": original_slot,
@@ -312,10 +306,6 @@ def normalize_hours_text(cell_value, start_time_str=None, end_time_str=None):
         return f"{people}人"
     htxt = f"{int(hours)}小時" if float(hours).is_integer() else f"{hours}小時"
     return f"{people}人{htxt}"
-
-
-def calc_occurrence_price(date_value, people, hours):
-    return int(get_unit_price_by_date(date_value) * people * hours)
 
 
 def build_group_key(row):
@@ -550,11 +540,17 @@ def update_sheet_rows(ws, row_results):
         info["車馬費"] = xyz["車馬費"]
 
         for key, value in info.items():
-            if key in header_index:
-                updates.append({
-                    "range": gspread.utils.rowcol_to_a1(row_num, header_index[key]),
-                    "values": [[("" if value is None else str(value))]],
-                })
+            if key not in header_index:
+                continue
+
+            # 狀態空白時不要覆蓋原本工作表值
+            if key == "狀態" and str(value).strip() == "":
+                continue
+
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(row_num, header_index[key]),
+                "values": [[("" if value is None else str(value))]],
+            })
 
     if updates:
         ws.batch_update(updates)
@@ -622,9 +618,10 @@ def get_member(session, phone, token, clean_type_id):
 
 
 def pick_best_address_info(member_payload, target_address):
+    """
+    強制以真正下拉地址為主；沒有 addressId 視為沒選到下拉地址
+    """
     member = member_payload.get("member", {}) if isinstance(member_payload, dict) else {}
-    purchase = member_payload.get("purchase", {}) if isinstance(member_payload, dict) else {}
-    address_list = member_payload.get("address", []) if isinstance(member_payload, dict) else []
     member_address_list = member.get("memberAddressList", []) if isinstance(member, dict) else []
 
     target_norm = normalize_addr_for_match(target_address)
@@ -632,7 +629,7 @@ def pick_best_address_info(member_payload, target_address):
     for item in member_address_list:
         item_addr = str(item.get("address", "")).strip()
         if normalize_addr_for_match(item_addr) == target_norm:
-            result = {
+            return {
                 "addressId": str(item.get("id", "")).strip(),
                 "country_id": item.get("countryId", ""),
                 "area_id": item.get("areaId", ""),
@@ -641,49 +638,6 @@ def pick_best_address_info(member_payload, target_address):
                 "lng": item.get("lng", ""),
                 "company_id": item.get("companyId", 1),
                 "purchase": item.get("purchase", {}) if isinstance(item.get("purchase"), dict) else {},
-            }
-            return result
-
-    for item in address_list:
-        item_addr = str(item.get("address", "")).strip()
-        if normalize_addr_for_match(item_addr) == target_norm:
-            return {
-                "addressId": "",
-                "country_id": item.get("countryId", ""),
-                "area_id": item.get("areaId", ""),
-                "address": item_addr,
-                "lat": "",
-                "lng": "",
-                "company_id": 1,
-                "purchase": purchase if isinstance(purchase, dict) else {},
-            }
-
-    candidate_texts = []
-    for item in member_address_list:
-        addr = str(item.get("address", "")).strip()
-        if addr:
-            candidate_texts.append(addr)
-    for item in address_list:
-        addr = str(item.get("address", "")).strip()
-        if addr:
-            candidate_texts.append(addr)
-    candidate_texts = list(dict.fromkeys(candidate_texts))
-
-    if candidate_texts:
-        raise Exception("找不到完全相同地址。請確認地址是否一致。候選地址：" + "；".join(candidate_texts[:8]))
-
-    if isinstance(purchase, dict) and purchase:
-        purchase_addr = str(purchase.get("address", "")).strip()
-        if purchase_addr and normalize_addr_for_match(purchase_addr) == target_norm:
-            return {
-                "addressId": "",
-                "country_id": purchase.get("country_id", ""),
-                "area_id": purchase.get("area_id", ""),
-                "address": purchase_addr,
-                "lat": purchase.get("lat", ""),
-                "lng": purchase.get("lng", ""),
-                "company_id": purchase.get("company_id", 1),
-                "purchase": purchase,
             }
 
     return {}
@@ -1187,6 +1141,7 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
 
 
 def filter_dates_by_balance(date_slots, date_prices, stored_value):
+    # 只用服務費 price 判斷，車馬費不算在儲值金
     selected_slots, selected_prices, total = [], [], 0
     for slot, price in zip(date_slots, date_prices):
         if total + price <= stored_value:
@@ -1234,8 +1189,14 @@ def stage_calendar_color(row, gcal_service, region):
         }
 
 
-def stage_update_status(order_no, calendar_info):
-    return {"狀態": "已安排"} if order_no and calendar_info.get("日曆改色結果") == "成功" else {}
+def stage_update_status(order_no, confirm_info, calendar_info):
+    confirm_ok = str(confirm_info.get("確認信", "")).strip() == "已發送"
+    calendar_ok = str(calendar_info.get("日曆改色結果", "")).strip() == "成功"
+
+    if order_no and confirm_ok and calendar_ok:
+        return {"狀態": "已安排"}
+
+    return {}
 
 
 def has_action(selected_actions, action_name):
@@ -1268,16 +1229,20 @@ def process_existing_order_only(row, gcal_service, region, session, selected_act
     )
 
     did_anything = False
+    confirm_info = {}
+    calendar_info = {}
 
     if has_action(selected_actions, "寄確認信"):
-        result.update(stage_send_confirmation(order_no, session))
+        confirm_info = stage_send_confirmation(order_no, session)
+        result.update(confirm_info)
         did_anything = True
 
     if has_action(selected_actions, "改 Google 日曆"):
         calendar_info = stage_calendar_color(row, gcal_service, region)
         result.update(calendar_info)
-        result.update(stage_update_status(order_no, calendar_info))
         did_anything = True
+
+    result.update(stage_update_status(order_no, confirm_info, calendar_info))
 
     if did_anything:
         result["結果"] = "成功"
@@ -1313,6 +1278,8 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     best_addr = pick_best_address_info(member_payload, target_address)
     if not best_addr:
         raise Exception("找不到對應地址資料")
+    if not str(best_addr.get("addressId", "")).strip():
+        raise Exception(f"地址存在但未選到下拉地址，缺少 addressId：{target_address}")
 
     selected_address = str(best_addr.get("address") or target_address).strip()
 
@@ -1330,13 +1297,15 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         token,
         clean_type_id,
     )
+    if not addr_check:
+        raise Exception(f"查詢地址/地區失敗：{selected_address}")
 
-    if addr_check and isinstance(addr_check.get("area"), dict):
+    if isinstance(addr_check.get("area"), dict):
         best_addr["area_id"] = addr_check["area"].get("area_id", best_addr.get("area_id"))
         best_addr["company_id"] = addr_check["area"].get("company_id", best_addr.get("company_id"))
         best_addr["country_id"] = addr_check["area"].get("country_id", best_addr.get("country_id"))
 
-    if addr_check and isinstance(addr_check.get("purchase"), dict):
+    if isinstance(addr_check.get("purchase"), dict):
         purchase_info = addr_check["purchase"]
         best_addr["purchase"] = purchase_info
         best_addr["fare"] = purchase_info.get("fare") or purchase_info.get("car_fare") or best_addr.get("fare", "0")
@@ -1384,8 +1353,6 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         payload["hour"] = str(calc_fields.get("hour") or base_data.get("hour") or "")
         payload["price"] = str(calc_fields.get("price") or "0")
         payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
-
-        # 車馬費獨立帶出，不算在儲值金中
         payload["fare"] = str(calc_fields.get("fare") or best_addr.get("fare") or "0")
         payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
         payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
@@ -1441,13 +1408,12 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
                 result.update(calendar_info)
                 if existing_order_no:
-                    result.update(stage_update_status(existing_order_no, calendar_info))
+                    result.update(stage_update_status(existing_order_no, result, calendar_info))
 
             row_results[detail["row_num"]] = result
 
         return row_results
 
-    # 每一筆用自己的 priced payload 查班表
     no_slot_dates = []
     valid_details = []
 
@@ -1518,7 +1484,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if not send_details:
         return row_results
 
-    # 為安全與一致性，每筆單獨送出
+    # 每筆單獨送出，避免日期互相污染
     for detail in send_details:
         payload = detail["payload"].copy()
         slots = [detail["slot"]]
@@ -1573,13 +1539,18 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             fare=meta.get("車馬費", "0") or str(detail["payload"].get("fare") or "0"),
         )
 
+        confirm_info = {}
+        calendar_info = {}
+
         if has_action(selected_actions, "寄確認信"):
-            stage_result.update(stage_send_confirmation(order_no, session))
+            confirm_info = stage_send_confirmation(order_no, session)
+            stage_result.update(confirm_info)
 
         if has_action(selected_actions, "改 Google 日曆"):
             calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
             stage_result.update(calendar_info)
-            stage_result.update(stage_update_status(order_no, calendar_info))
+
+        stage_result.update(stage_update_status(order_no, confirm_info, calendar_info))
 
         row_results[detail["row_num"]] = stage_result
 
