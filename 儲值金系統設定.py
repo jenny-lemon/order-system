@@ -97,7 +97,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-24-final-fare-status ===")
+print("=== 儲值金系統設定.py 版本：2026-04-24-final-match-manual-calc ===")
 
 
 # =========================
@@ -743,27 +743,60 @@ def calculate_hour(session, order_data, token):
 
 
 def extract_calc_fields(calc_result, fallback_hours="", fallback_fare="0"):
-    if not isinstance(calc_result, dict):
-        return {
-            "hour": str(fallback_hours or ""),
-            "price": "0",
-            "price_vvip": "0",
-            "fare": str(fallback_fare or "0"),
-        }
+    """
+    calculate_hour 的回傳格式可能是 dict/list/html/string。
+    手動流程是先送 hour/price/fare 空值，後台回傳後再填入：
+    hour=4, price=4771, fare=200。
+    這裡用遞迴 + 字串 regex 雙重解析。
+    """
+    def regex_find(text, names):
+        text = str(text or "")
+        for name in names:
+            patterns = [
+                rf'"{re.escape(name)}"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?',
+                rf"'{re.escape(name)}'\s*:\s*'?([0-9]+(?:\.[0-9]+)?)'?",
+                rf'name=["\\\']{re.escape(name)}["\\\'][^>]*value=["\\\']?([0-9]+(?:\.[0-9]+)?)',
+                rf'id=["\\\']{re.escape(name)}["\\\'][^>]*value=["\\\']?([0-9]+(?:\.[0-9]+)?)',
+                rf'{re.escape(name)}=([0-9]+(?:\.[0-9]+)?)',
+            ]
+            for pat in patterns:
+                m = re.search(pat, text)
+                if m:
+                    return m.group(1)
+        return ""
 
-    def pick(*keys, default=""):
-        for k in keys:
-            v = calc_result.get(k)
-            if v not in (None, ""):
-                return str(v)
-        return str(default)
+    if isinstance(calc_result, (dict, list)):
+        hour = find_nested_value(calc_result, [
+            "hour", "clean_hour", "hours", "total_hour", "service_hour"
+        ])
+        price = find_nested_value(calc_result, [
+            "price", "total_price", "service_price", "amount", "total", "money"
+        ])
+        price_vvip = find_nested_value(calc_result, [
+            "price_vvip", "vvip_price", "vip_price"
+        ])
+        fare = find_nested_value(calc_result, [
+            "fare", "car_fare", "traffic_fee", "trafficFee", "carFare", "車馬費"
+        ])
+    else:
+        hour = price = price_vvip = fare = ""
 
-    raw_fare = pick("fare", "car_fare", "traffic_fee", "trafficFee", default="")
+    raw_text = json.dumps(calc_result, ensure_ascii=False) if isinstance(calc_result, (dict, list)) else str(calc_result or "")
+
+    if not hour:
+        hour = regex_find(raw_text, ["hour", "clean_hour", "hours", "total_hour", "service_hour"])
+    if not price:
+        price = regex_find(raw_text, ["price", "total_price", "service_price", "amount", "total", "money"])
+    if not price_vvip:
+        price_vvip = regex_find(raw_text, ["price_vvip", "vvip_price", "vip_price"])
+    if not fare:
+        fare = regex_find(raw_text, ["fare", "car_fare", "traffic_fee", "trafficFee", "carFare"])
+
     return {
-        "hour": pick("hour", "clean_hour", default=fallback_hours or ""),
-        "price": pick("price", "total_price", "service_price", default="0"),
-        "price_vvip": pick("price_vvip", "vvip_price", default="0"),
-        "fare": first_nonzero(raw_fare, fallback_fare, default="0"),
+        "hour": str(hour or fallback_hours or ""),
+        "price": first_nonzero(price, default="0"),
+        "price_vvip": str(price_vvip or "0"),
+        "fare": first_nonzero(fare, fallback_fare, default="0"),
     }
 
 
@@ -1222,12 +1255,6 @@ def stage_calendar_color(row, gcal_service, region):
 
 
 def stage_update_status(order_no, confirm_info, calendar_info, row_result=None):
-    """
-    I欄狀態規則：
-    只有「有訂單編號 + 確認信已發送 + Google 日曆改色成功 + XYZ欄位已回填」
-    才回傳 {"狀態": "已安排"}。
-    其他情況回傳空 dict，update_sheet_rows 會保留原本的「未安排」。
-    """
     confirm_ok = str(confirm_info.get("確認信", "")).strip() == "已發送"
     calendar_ok = str(calendar_info.get("日曆改色結果", "")).strip() == "成功"
 
@@ -1343,10 +1370,6 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if not addr_check:
         raise Exception(f"查詢地址/地區失敗：{selected_address}")
 
-    import streamlit as st
-
-    st.write("🟡 check_contain raw =", addr_check)
-
     # 確認是否真的有模擬按下「查詢地址」
     print("[DEBUG] check_contain raw =", addr_check)
     try:
@@ -1431,11 +1454,26 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
     def build_priced_payload_for_date(date_s):
         calc_data = base_data.copy()
-        calc_data["date_s"] = date_s
+
+        # 重要：完全模擬手動「計算時數」流程。
+        # 手動 request 會送 date_s/hour/price/price_vvip/fare 空值，
+        # 讓後台自行計算 hour/price/fare；若先帶 0，後台可能不會重算。
+        calc_data["date_s"] = ""
+        calc_data["hour"] = ""
+        calc_data["price"] = ""
+        calc_data["price_vvip"] = ""
+        calc_data["fare"] = ""
 
         calc_result = calculate_hour(session, calc_data, token)
         if not calc_result:
             raise Exception(f"計算時數失敗：{date_s}")
+
+        print("[DEBUG] calculate_hour raw =", calc_result)
+        try:
+            if st is not None:
+                st.write("🟠 calculate_hour raw =", calc_result)
+        except Exception:
+            pass
 
         calc_fields = extract_calc_fields(
             calc_result,
@@ -1444,11 +1482,22 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         )
 
         payload = base_data.copy()
-        payload["date_s"] = date_s
+        payload["date_s"] = ""
         payload["hour"] = str(calc_fields.get("hour") or base_data.get("hour") or "")
         payload["price"] = str(calc_fields.get("price") or "0")
         payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
+
+        print("[DEBUG] calc_fields =", calc_fields)
+        try:
+            if st is not None:
+                st.write("🟣 calc_fields =", calc_fields)
+        except Exception:
+            pass
         payload["fare"] = first_nonzero(calc_fields.get("fare"), best_addr.get("fare"), base_data.get("fare"), default="0")
+
+        if str(payload.get("price", "")).strip() in ("", "0", "0.0"):
+            raise Exception(f"計算時數後 price 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
+
         payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
         payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
         payload["company_id"] = str(base_data.get("company_id") or best_addr.get("company_id") or "")
@@ -1595,9 +1644,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                   "company_id": payload.get("company_id"),
                   "notice_len": len(str(payload.get("notice") or "")),
               })
-        
-        st.write("🔵 booking payload =", payload)
-        
+
         session.post(
             BOOKING_URL,
             data={**payload, "_token": token, "date_list[]": slots},
