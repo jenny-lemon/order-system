@@ -1343,6 +1343,10 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if not addr_check:
         raise Exception(f"查詢地址/地區失敗：{selected_address}")
 
+    import streamlit as st
+
+    st.write("🟡 check_contain raw =", addr_check)
+
     # 確認是否真的有模擬按下「查詢地址」
     print("[DEBUG] check_contain raw =", addr_check)
     try:
@@ -1591,7 +1595,9 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                   "company_id": payload.get("company_id"),
                   "notice_len": len(str(payload.get("notice") or "")),
               })
-
+        
+        st.write("🔵 booking payload =", payload)
+        
         session.post(
             BOOKING_URL,
             data={**payload, "_token": token, "date_list[]": slots},
