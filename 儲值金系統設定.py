@@ -97,7 +97,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-23-final-full ===")
+print("=== 儲值金系統設定.py 版本：2026-04-24-final-fare-status ===")
 
 
 # =========================
@@ -125,6 +125,36 @@ def normalize_addr_for_match(addr):
 
 def same_address(a, b):
     return normalize_addr_for_match(a) == normalize_addr_for_match(b)
+
+
+def first_nonzero(*values, default="0"):
+    for value in values:
+        text = str(value if value is not None else "").strip()
+        if text not in ("", "0", "0.0", "nan", "None"):
+            return text
+    return str(default)
+
+
+def find_nested_value(obj, keys):
+    key_set = {str(k) for k in keys}
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if str(key) in key_set and value not in (None, ""):
+                return value
+
+        for value in obj.values():
+            found = find_nested_value(value, key_set)
+            if found not in (None, ""):
+                return found
+
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_nested_value(item, key_set)
+            if found not in (None, ""):
+                return found
+
+    return ""
 
 
 def parse_date_value(date_value):
@@ -543,8 +573,9 @@ def update_sheet_rows(ws, row_results):
             if key not in header_index:
                 continue
 
-            # 狀態空白時不要覆蓋原本工作表值
-            if key == "狀態" and str(value).strip() == "":
+            # I欄「狀態」只允許在成功完成流程時寫入「已安排」。
+            # 其他空白或非已安排值都不覆蓋原本的「未安排」。
+            if key == "狀態" and str(value).strip() != "已安排":
                 continue
 
             updates.append({
@@ -727,11 +758,12 @@ def extract_calc_fields(calc_result, fallback_hours="", fallback_fare="0"):
                 return str(v)
         return str(default)
 
+    raw_fare = pick("fare", "car_fare", "traffic_fee", "trafficFee", default="")
     return {
         "hour": pick("hour", "clean_hour", default=fallback_hours or ""),
         "price": pick("price", "total_price", "service_price", default="0"),
         "price_vvip": pick("price_vvip", "vvip_price", default="0"),
-        "fare": pick("fare", "car_fare", default=fallback_fare or "0"),
+        "fare": first_nonzero(raw_fare, fallback_fare, default="0"),
     }
 
 
@@ -1189,11 +1221,22 @@ def stage_calendar_color(row, gcal_service, region):
         }
 
 
-def stage_update_status(order_no, confirm_info, calendar_info):
+def stage_update_status(order_no, confirm_info, calendar_info, row_result=None):
+    """
+    I欄狀態規則：
+    只有「有訂單編號 + 確認信已發送 + Google 日曆改色成功 + XYZ欄位已回填」
+    才回傳 {"狀態": "已安排"}。
+    其他情況回傳空 dict，update_sheet_rows 會保留原本的「未安排」。
+    """
     confirm_ok = str(confirm_info.get("確認信", "")).strip() == "已發送"
     calendar_ok = str(calendar_info.get("日曆改色結果", "")).strip() == "成功"
 
-    if order_no and confirm_ok and calendar_ok:
+    row_result = row_result or {}
+    staff_ok = str(row_result.get("服務人員", "")).strip() not in ("", "無人力")
+    service_status_ok = str(row_result.get("服務狀態", "")).strip() != ""
+    fare_ok = str(row_result.get("車馬費", "")).strip() != ""
+
+    if order_no and confirm_ok and calendar_ok and staff_ok and service_status_ok and fare_ok:
         return {"狀態": "已安排"}
 
     return {}
@@ -1242,7 +1285,7 @@ def process_existing_order_only(row, gcal_service, region, session, selected_act
         result.update(calendar_info)
         did_anything = True
 
-    result.update(stage_update_status(order_no, confirm_info, calendar_info))
+    result.update(stage_update_status(order_no, confirm_info, calendar_info, result))
 
     if did_anything:
         result["結果"] = "成功"
@@ -1300,20 +1343,49 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if not addr_check:
         raise Exception(f"查詢地址/地區失敗：{selected_address}")
 
-    if isinstance(addr_check.get("area"), dict):
-        best_addr["area_id"] = addr_check["area"].get("area_id", best_addr.get("area_id"))
-        best_addr["company_id"] = addr_check["area"].get("company_id", best_addr.get("company_id"))
-        best_addr["country_id"] = addr_check["area"].get("country_id", best_addr.get("country_id"))
+    # 確認是否真的有模擬按下「查詢地址」
+    print("[DEBUG] check_contain raw =", addr_check)
+    try:
+        if st is not None:
+            st.write("check_contain raw =", addr_check)
+    except Exception:
+        pass
 
-    if isinstance(addr_check.get("purchase"), dict):
-        purchase_info = addr_check["purchase"]
+    area_info = addr_check.get("area") if isinstance(addr_check.get("area"), dict) else {}
+    purchase_info = addr_check.get("purchase") if isinstance(addr_check.get("purchase"), dict) else {}
+
+    if area_info:
+        best_addr["area_id"] = area_info.get("area_id", best_addr.get("area_id"))
+        best_addr["company_id"] = area_info.get("company_id", best_addr.get("company_id"))
+        best_addr["country_id"] = area_info.get("country_id", best_addr.get("country_id"))
+
+    if purchase_info:
         best_addr["purchase"] = purchase_info
-        best_addr["fare"] = purchase_info.get("fare") or purchase_info.get("car_fare") or best_addr.get("fare", "0")
-        best_addr["notice"] = (
-            purchase_info.get("notice")
-            or purchase_info.get("service_notice")
-            or best_addr.get("notice", "")
-        )
+
+    # 模擬後台「查詢地址」後的資料補齊：
+    # 車馬費可能在 purchase、area 或巢狀欄位中，需全部掃描。
+    fare_from_check = first_nonzero(
+        purchase_info.get("fare") if purchase_info else "",
+        purchase_info.get("car_fare") if purchase_info else "",
+        purchase_info.get("traffic_fee") if purchase_info else "",
+        area_info.get("fare") if area_info else "",
+        area_info.get("car_fare") if area_info else "",
+        area_info.get("traffic_fee") if area_info else "",
+        find_nested_value(addr_check, ["fare", "car_fare", "traffic_fee", "trafficFee", "車馬費"]),
+        best_addr.get("fare", ""),
+        default="0",
+    )
+    best_addr["fare"] = fare_from_check
+
+    notice_from_check = (
+        (purchase_info.get("notice") if purchase_info else "")
+        or (purchase_info.get("service_notice") if purchase_info else "")
+        or (area_info.get("notice") if area_info else "")
+        or (area_info.get("service_notice") if area_info else "")
+        or best_addr.get("notice", "")
+        or ""
+    )
+    best_addr["notice"] = notice_from_check
 
     base_data = prepare_base_order_data(
         row0,
@@ -1325,6 +1397,25 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         system_period,
         mapped,
     )
+
+    # 強制套用查詢地址後取得的區域/車馬費資料
+    base_data["fare"] = first_nonzero(best_addr.get("fare"), base_data.get("fare"), default="0")
+    base_data["notice"] = str(best_addr.get("notice") or base_data.get("notice") or "")
+    base_data["area_id"] = str(best_addr.get("area_id") or base_data.get("area_id") or "")
+    base_data["company_id"] = str(best_addr.get("company_id") or base_data.get("company_id") or "")
+    base_data["country_id"] = str(best_addr.get("country_id") or base_data.get("country_id") or "")
+    base_data["addressId"] = str(best_addr.get("addressId") or base_data.get("addressId") or "")
+    base_data["lat"] = str(best_addr.get("lat") or base_data.get("lat") or "")
+    base_data["lng"] = str(best_addr.get("lng") or base_data.get("lng") or "")
+
+    print("[DEBUG] address check result =", {
+        "addressId": base_data.get("addressId"),
+        "area_id": base_data.get("area_id"),
+        "company_id": base_data.get("company_id"),
+        "fare": base_data.get("fare"),
+        "lat": base_data.get("lat"),
+        "lng": base_data.get("lng"),
+    })
 
     def build_time_fields():
         sms_time = base_data.get("period", "")
@@ -1353,7 +1444,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         payload["hour"] = str(calc_fields.get("hour") or base_data.get("hour") or "")
         payload["price"] = str(calc_fields.get("price") or "0")
         payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
-        payload["fare"] = str(calc_fields.get("fare") or best_addr.get("fare") or "0")
+        payload["fare"] = first_nonzero(calc_fields.get("fare"), best_addr.get("fare"), base_data.get("fare"), default="0")
         payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
         payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
         payload["company_id"] = str(base_data.get("company_id") or best_addr.get("company_id") or "")
@@ -1408,7 +1499,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
                 result.update(calendar_info)
                 if existing_order_no:
-                    result.update(stage_update_status(existing_order_no, result, calendar_info))
+                    result.update(stage_update_status(existing_order_no, result, calendar_info, result))
 
             row_results[detail["row_num"]] = result
 
@@ -1498,6 +1589,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                   "addressId": payload.get("addressId"),
                   "area_id": payload.get("area_id"),
                   "company_id": payload.get("company_id"),
+                  "notice_len": len(str(payload.get("notice") or "")),
               })
 
         session.post(
@@ -1550,7 +1642,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
             stage_result.update(calendar_info)
 
-        stage_result.update(stage_update_status(order_no, confirm_info, calendar_info))
+        stage_result.update(stage_update_status(order_no, confirm_info, calendar_info, result))
 
         row_results[detail["row_num"]] = stage_result
 
