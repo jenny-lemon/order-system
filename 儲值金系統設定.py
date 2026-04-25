@@ -98,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-25-final-sheet-hour-default-2p ===")
+print("=== 儲值金系統設定.py 版本：2026-04-25-final-staff-person-hour ===")
 
 
 # =========================
@@ -327,12 +327,7 @@ def parse_service_human_hour(service_text, start_time, end_time):
     最終規則：
     1. 預設 2 人。
     2. 預設時數 = Google Sheet 開始/結束時間換算。
-       09:00-11:00 -> 2
-       09:00-12:00 -> 3
-       09:00-16:00 -> 6（扣午休）
-       09:00-18:00 -> 8（扣午休）
     3. 若 A欄/服務人時 有明確寫「3人4小時」，則人數與時數都以 A欄為準。
-       例如：1人3小時、3人4小時、4人2小時。
     """
     people = 2
     hours = calc_effective_hours_from_time(start_time, end_time)
@@ -831,6 +826,72 @@ def get_section_raw(session, order_data, token, date_slot):
 
     resp = session.post(GET_SECTION_URL, data=data, headers=HEADERS, allow_redirects=True)
     return resp.text if resp.status_code == 200 else ""
+
+
+def extract_cleaners_from_section_response(raw_text, date_slot):
+    """
+    從 get_section 回傳抓指定日期/時段的人員。
+    支援 JSON list：
+    [{"date":"2026-05-14","section":"14:00-18:00","cleaner":["胡偉勝"]}]
+    """
+    if not raw_text:
+        return []
+
+    date_part, period_part = date_slot.split("_", 1)
+    raw = str(raw_text)
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = data.get("data") or data.get("result") or data.get("sections") or []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                item_date = str(item.get("date", "")).strip()
+                item_section = str(item.get("section", "")).strip().replace(" ", "")
+                if item_date == date_part and item_section == period_part.replace(" ", ""):
+                    cleaners = item.get("cleaner") or item.get("cleaners") or []
+                    if isinstance(cleaners, list):
+                        return [str(x).strip().lstrip("＊*") for x in cleaners if str(x).strip()]
+                    if isinstance(cleaners, str) and cleaners.strip():
+                        return [x.strip().lstrip("＊*") for x in re.split(r"[,，、/]+", cleaners) if x.strip()]
+    except Exception:
+        pass
+
+    text = html.unescape(raw)
+    try:
+        text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    except Exception:
+        pass
+
+    compact = re.sub(r"\s+", "", text)
+    d = date_part
+    p = period_part.replace(" ", "")
+    idx = compact.find(d)
+    if idx >= 0:
+        nearby = compact[idx:idx + 600]
+        pidx = nearby.find(p)
+        if pidx >= 0:
+            nearby = nearby[pidx:pidx + 500]
+            m = re.search(r"[（(]([^）)]+)[）)]", nearby)
+            if m:
+                return [x.strip().lstrip("＊*") for x in re.split(r"[,，、/]+", m.group(1)) if x.strip()]
+
+    return []
+
+
+def format_staff_from_cleaners(cleaners, people=None):
+    cleaned = []
+    for name in cleaners or []:
+        text = str(name).strip().lstrip("＊*")
+        if text:
+            cleaned.append(text)
+
+    if not cleaned:
+        return "無人力"
+
+    return " X ".join(cleaned)
 
 
 def slot_exists_in_section_response(raw_text, date_slot):
@@ -1581,6 +1642,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         payload = base_data.copy()
         payload["date_s"] = date_s
         payload["hour"] = str(base_data.get("hour") or calc_fields.get("hour") or "")
+        payload["person"] = str(base_data.get("person") or payload.get("person") or "")
         payload["price"] = str(calc_fields.get("price") or "0")
         payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
 
@@ -1682,10 +1744,14 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     for detail in row_details:
         raw = get_section_raw(session, detail["payload"], token, detail["slot"])
         slot_ok = slot_exists_in_section_response(raw, detail["slot"])
+        cleaners = extract_cleaners_from_section_response(raw, detail["slot"])
+        detail["section_cleaners"] = cleaners
+        detail["section_staff"] = format_staff_from_cleaners(cleaners, people=people)
 
         print("[DEBUG] section match =", {
             "slot": detail["slot"],
             "matched": slot_ok,
+            "staff": detail.get("section_staff"),
             "raw_preview": str(raw)[:500],
         })
         try:
@@ -1693,6 +1759,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 st.write("🧩 section match =", {
                     "slot": detail["slot"],
                     "matched": slot_ok,
+                    "staff": detail.get("section_staff"),
                     "raw_preview": str(raw)[:500],
                 })
         except Exception:
@@ -1755,7 +1822,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 sms_time=sms_time,
                 customer_note=customer_note,
                 status_value="",
-                staff="無人力",
+                staff=detail.get("section_staff") or "無人力",
                 service_status="未處理",
                 fare=str(detail["payload"].get("fare") or "0"),
             )
@@ -1799,13 +1866,17 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 sms_time=sms_time,
                 customer_note=customer_note,
                 status_value="",
-                staff="無人力",
+                staff=detail.get("section_staff") or "無人力",
                 service_status="未處理",
                 fare=str(detail["payload"].get("fare") or "0"),
             )
             continue
 
         meta = fetch_order_meta_by_order_no(session, order_no)
+
+        staff_value = meta.get("服務人員", "")
+        if not staff_value or staff_value == "無人力":
+            staff_value = detail.get("section_staff") or "無人力"
 
         stage_result = build_row_result(
             order_no=order_no,
@@ -1814,7 +1885,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             sms_time=sms_time,
             customer_note=customer_note,
             status_value="",
-            staff=meta.get("服務人員", "無人力"),
+            staff=staff_value,
             service_status=meta.get("服務狀態", "未處理"),
             fare=meta.get("車馬費", "0") or str(detail["payload"].get("fare") or "0"),
         )
