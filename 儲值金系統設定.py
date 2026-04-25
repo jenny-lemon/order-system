@@ -98,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-25-final-robust-section-match ===")
+print("=== 儲值金系統設定.py 版本：2026-04-25-final-sheet-hour-person-section ===")
 
 
 # =========================
@@ -323,21 +323,25 @@ def map_to_system_slot(start_time_str, end_time_str, service_text=None):
 
 
 def parse_service_human_hour(service_text, start_time, end_time):
+    """
+    人數：以 Google Sheet「服務人時」欄位為準，沒寫才預設 2 人。
+    時數：以 Google Sheet「開始時間 / 結束時間」為準，不用服務人時的時數反推。
+    這樣 09:00-12:00 一定是 3 小時，不會因為服務人時誤寫 2 小時而查成 09:00-11:00。
+    09:00-16:00 / 09:00-18:00 會自動扣午休 1 小時。
+    """
+    people = 2
+
     if service_text and str(service_text).strip():
         text = str(service_text).strip()
         people_match = re.search(r"(\d+)\s*人", text)
-        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*小時", text)
-
-        people = int(people_match.group(1)) if people_match else 2
-        if hour_match:
-            hours = float(hour_match.group(1))
-            return people, int(hours) if float(hours).is_integer() else hours
+        if people_match:
+            people = int(people_match.group(1))
 
     hours = calc_effective_hours_from_time(start_time, end_time)
     if hours is None:
-        return None, None
+        return people, None
 
-    return 2, int(hours) if float(hours).is_integer() else hours
+    return people, int(hours) if float(hours).is_integer() else hours
 
 
 def normalize_hours_text(cell_value, start_time_str=None, end_time_str=None):
@@ -1399,6 +1403,23 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if hours is None:
         raise Exception("無法判斷服務時數")
 
+    print("[DEBUG] parsed person/hour =", {
+        "服務人時": str(row0["服務人時"]),
+        "sheet_time": normalize_period_text(row0["開始時間"], row0["結束時間"]),
+        "person": people,
+        "hour": hours,
+    })
+    try:
+        if st is not None:
+            st.write("👥 parsed person/hour =", {
+                "服務人時": str(row0["服務人時"]),
+                "sheet_time": normalize_period_text(row0["開始時間"], row0["結束時間"]),
+                "person": people,
+                "hour": hours,
+            })
+    except Exception:
+        pass
+
     phone = normalize_phone(row0["電話"])
     member_payload = get_member(session, phone, token, clean_type_id)
     if not member_payload:
@@ -1522,7 +1543,10 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         # 手動 request 會送 date_s/hour/price/price_vvip/fare 空值，
         # 讓後台自行計算 hour/price/fare；若先帶 0，後台可能不會重算。
         calc_data["date_s"] = ""
-        calc_data["hour"] = ""
+        # 查詢班表/計算時數前，hour/person 必須正確。
+        # hour 使用 Google Sheet 開始/結束時間換算後的 base_data["hour"]。
+        calc_data["hour"] = str(base_data.get("hour") or "")
+        calc_data["person"] = str(base_data.get("person") or "")
         calc_data["price"] = ""
         calc_data["price_vvip"] = ""
         calc_data["fare"] = ""
