@@ -97,7 +97,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-24-final-match-manual-calc ===")
+print("=== 儲值金系統設定.py 版本：2026-04-25-final-sheet-time-slot ===")
 
 
 # =========================
@@ -254,7 +254,35 @@ def is_morning_slot(slot_text):
 
 
 def map_to_system_slot(start_time_str, end_time_str, service_text=None):
+    """
+    重要規則：
+    1. Google Sheet 的開始/結束時間 = 客戶實際要約的服務時段，也用來查班表。
+       例如 Sheet 是 09:00-12:00，就一定查 09:00-12:00。
+    2. calculate_hour 回傳的 hour 只用來算價格，不用來反推班表時段。
+    3. 只有特殊時段 10:00-12:00，要送系統 09:00-11:00，並在簡訊/客備註記原始時間。
+    """
     original_slot = normalize_period_text(start_time_str, end_time_str)
+
+    if original_slot == "10:00-12:00":
+        return {
+            "original_slot": original_slot,
+            "system_slot": "09:00-11:00",
+            "need_note": True,
+            "sms_time": original_slot,
+            "customer_time_note": f"服務時間：{original_slot}",
+        }
+
+    # 標準時段直接用 Sheet 原始時段，不用 hour 反推
+    if original_slot in STANDARD_SLOTS:
+        return {
+            "original_slot": original_slot,
+            "system_slot": original_slot,
+            "need_note": False,
+            "sms_time": "",
+            "customer_time_note": "",
+        }
+
+    # 非標準時段才用服務時數對應系統可送時段
     actual_hours = None
 
     if service_text and str(service_text).strip():
@@ -271,25 +299,6 @@ def map_to_system_slot(start_time_str, end_time_str, service_text=None):
 
     if actual_hours is None:
         raise Exception(f"無法解析服務時段: {start_time_str}-{end_time_str}")
-
-    # 特殊規則
-    if original_slot == "10:00-12:00":
-        return {
-            "original_slot": original_slot,
-            "system_slot": "09:00-11:00",
-            "need_note": True,
-            "sms_time": original_slot,
-            "customer_time_note": f"服務時間：{original_slot}",
-        }
-
-    if original_slot in STANDARD_SLOTS:
-        return {
-            "original_slot": original_slot,
-            "system_slot": original_slot,
-            "need_note": False,
-            "sms_time": "",
-            "customer_time_note": "",
-        }
 
     sh, sm, eh, em = parse_time_slot(start_time_str, end_time_str)
     original_is_morning = sh < 12
@@ -1518,6 +1527,27 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             "row": row,
             "payload": priced_payload,
         })
+
+        print("[DEBUG] row slot =", {
+            "row_num": row_num,
+            "sheet_time": normalize_period_text(row["開始時間"], row["結束時間"]),
+            "system_period": system_period,
+            "slot": f"{date_s}_{system_period}",
+            "price": priced_payload.get("price"),
+            "fare": priced_payload.get("fare"),
+        })
+        try:
+            if st is not None:
+                st.write("🧭 row slot =", {
+                    "row_num": row_num,
+                    "sheet_time": normalize_period_text(row["開始時間"], row["結束時間"]),
+                    "system_period": system_period,
+                    "slot": f"{date_s}_{system_period}",
+                    "price": priced_payload.get("price"),
+                    "fare": priced_payload.get("fare"),
+                })
+        except Exception:
+            pass
 
     need_create_order = has_action(selected_actions, "建單")
     row_results = {}
