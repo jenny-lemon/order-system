@@ -1642,7 +1642,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             calendar_info = stage_calendar_color(detail["row"], gcal_service, region)
             stage_result.update(calendar_info)
 
-        stage_result.update(stage_update_status(order_no, confirm_info, calendar_info, result))
+        stage_result.update(stage_update_status(order_no, confirm_info, calendar_info, stage_result))
 
         row_results[detail["row_num"]] = stage_result
 
