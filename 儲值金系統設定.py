@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import html
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
@@ -97,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-25-final-sheet-time-slot ===")
+print("=== 儲值金系統設定.py 版本：2026-04-25-final-robust-section-match ===")
 
 
 # =========================
@@ -819,13 +820,66 @@ def get_section_raw(session, order_data, token, date_slot):
 
 
 def slot_exists_in_section_response(raw_text, date_slot):
+    """
+    get_section 回傳可能是 HTML、JSON 包 HTML、escaped HTML。
+    這裡不要只做單一 regex，改成多種格式都可比對。
+    """
     if not raw_text:
         return False
 
     date_part, period_part = date_slot.split("_", 1)
-    normalized = re.sub(r"\s+", "", raw_text)
-    pattern = re.escape(date_part) + r".*?" + re.escape(period_part)
-    return re.search(pattern, normalized) is not None
+    start_part, end_part = period_part.split("-", 1)
+
+    raw = str(raw_text)
+    unescaped = html.unescape(raw)
+
+    try:
+        soup_text = BeautifulSoup(unescaped, "html.parser").get_text(" ", strip=True)
+    except Exception:
+        soup_text = unescaped
+
+    candidates = [raw, unescaped, soup_text]
+
+    date_variants = list(dict.fromkeys([
+        date_part,
+        date_part.replace("-", "/"),
+        date_part.replace("-", ""),
+    ]))
+
+    period_variants = list(dict.fromkeys([
+        period_part,
+        period_part.replace(" ", ""),
+        f"{start_part} - {end_part}",
+        f"{start_part}~{end_part}",
+        f"{start_part}～{end_part}",
+    ]))
+
+    for text in candidates:
+        compact = re.sub(r"\s+", "", text)
+
+        for d in date_variants:
+            for p in period_variants:
+                dp = re.sub(r"\s+", "", d)
+                pp = re.sub(r"\s+", "", p)
+                if dp in compact and pp in compact:
+                    date_idx = compact.find(dp)
+                    period_idx = compact.find(pp)
+                    if date_idx >= 0 and period_idx >= 0 and abs(period_idx - date_idx) < 500:
+                        return True
+
+        for d in date_variants:
+            d_re = re.escape(d)
+            s_re = re.escape(start_part)
+            e_re = re.escape(end_part)
+            patterns = [
+                rf"{d_re}.{{0,500}}{s_re}\s*[-~～]\s*{e_re}",
+                rf"{d_re}.{{0,500}}{re.escape(period_part)}",
+            ]
+            for pat in patterns:
+                if re.search(pat, text, flags=re.S):
+                    return True
+
+    return False
 
 
 # =========================
@@ -1593,7 +1647,24 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
     for detail in row_details:
         raw = get_section_raw(session, detail["payload"], token, detail["slot"])
-        if slot_exists_in_section_response(raw, detail["slot"]):
+        slot_ok = slot_exists_in_section_response(raw, detail["slot"])
+
+        print("[DEBUG] section match =", {
+            "slot": detail["slot"],
+            "matched": slot_ok,
+            "raw_preview": str(raw)[:500],
+        })
+        try:
+            if st is not None:
+                st.write("🧩 section match =", {
+                    "slot": detail["slot"],
+                    "matched": slot_ok,
+                    "raw_preview": str(raw)[:500],
+                })
+        except Exception:
+            pass
+
+        if slot_ok:
             valid_details.append(detail)
         else:
             no_slot_dates.append(detail["date"])
