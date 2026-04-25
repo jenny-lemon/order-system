@@ -98,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-25-final-sheet-hour-person-section ===")
+print("=== 儲值金系統設定.py 版本：2026-04-25-final-sheet-hour-default-2p ===")
 
 
 # =========================
@@ -324,20 +324,30 @@ def map_to_system_slot(start_time_str, end_time_str, service_text=None):
 
 def parse_service_human_hour(service_text, start_time, end_time):
     """
-    人數：以 Google Sheet「服務人時」欄位為準，沒寫才預設 2 人。
-    時數：以 Google Sheet「開始時間 / 結束時間」為準，不用服務人時的時數反推。
-    這樣 09:00-12:00 一定是 3 小時，不會因為服務人時誤寫 2 小時而查成 09:00-11:00。
-    09:00-16:00 / 09:00-18:00 會自動扣午休 1 小時。
+    最終規則：
+    1. 預設 2 人。
+    2. 預設時數 = Google Sheet 開始/結束時間換算。
+       09:00-11:00 -> 2
+       09:00-12:00 -> 3
+       09:00-16:00 -> 6（扣午休）
+       09:00-18:00 -> 8（扣午休）
+    3. 若 A欄/服務人時 有明確寫「3人4小時」，則人數與時數都以 A欄為準。
+       例如：1人3小時、3人4小時、4人2小時。
     """
     people = 2
+    hours = calc_effective_hours_from_time(start_time, end_time)
 
     if service_text and str(service_text).strip():
         text = str(service_text).strip()
+
         people_match = re.search(r"(\d+)\s*人", text)
         if people_match:
             people = int(people_match.group(1))
 
-    hours = calc_effective_hours_from_time(start_time, end_time)
+        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*小時", text)
+        if hour_match:
+            hours = float(hour_match.group(1))
+
     if hours is None:
         return people, None
 
@@ -1542,9 +1552,9 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         # 重要：完全模擬手動「計算時數」流程。
         # 手動 request 會送 date_s/hour/price/price_vvip/fare 空值，
         # 讓後台自行計算 hour/price/fare；若先帶 0，後台可能不會重算。
-        calc_data["date_s"] = ""
-        # 查詢班表/計算時數前，hour/person 必須正確。
-        # hour 使用 Google Sheet 開始/結束時間換算後的 base_data["hour"]。
+        # 查詢班表/計算時數前，先把人數與時數改成 Google Sheet/A欄規則後的值。
+        # 不採用後台自動推回來的 hour 來決定班表。
+        calc_data["date_s"] = date_s
         calc_data["hour"] = str(base_data.get("hour") or "")
         calc_data["person"] = str(base_data.get("person") or "")
         calc_data["price"] = ""
@@ -1569,8 +1579,8 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         )
 
         payload = base_data.copy()
-        payload["date_s"] = ""
-        payload["hour"] = str(calc_fields.get("hour") or base_data.get("hour") or "")
+        payload["date_s"] = date_s
+        payload["hour"] = str(base_data.get("hour") or calc_fields.get("hour") or "")
         payload["price"] = str(calc_fields.get("price") or "0")
         payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
 
