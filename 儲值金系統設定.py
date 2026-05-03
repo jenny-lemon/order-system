@@ -98,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-04-25-final-staff-person-hour ===")
+print("=== 儲值金系統設定.py 版本：2026-05-03-final-staff-notice-aa ===")
 
 
 # =========================
@@ -435,6 +435,7 @@ def build_row_result(
     insufficient_date="",
     sms_time="",
     customer_note="",
+    service_notice="",
     confirm_mail="",
     calendar_result="",
     calendar_reason="",
@@ -462,6 +463,7 @@ def build_row_result(
         "餘額不足未送": insufficient_date,
         "簡訊實際服務時間": sms_time,
         "客人備註": customer_note,
+        "客服備註": service_notice,
         "確認信": confirm_mail,
         "日曆改色結果": calendar_result,
         "日曆改色原因": calendar_reason,
@@ -541,6 +543,7 @@ def ensure_columns_in_sheet(ws):
     required = [
         "簡訊實際服務時間",
         "客人備註",
+        "客服備註",
         "訂單編號",
         "結果",
         "原因",
@@ -1706,6 +1709,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         for detail in row_details:
             existing_order_no = str(detail["row"].get("訂單編號", "")).strip()
             sms_time, customer_note = build_time_fields()
+            service_notice = str(detail["payload"].get("notice") or "")
 
             meta = fetch_order_meta_by_order_no(session, existing_order_no) if existing_order_no else {
                 "服務人員": "無人力",
@@ -1719,6 +1723,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 reason="" if existing_order_no else "無訂單編號，無法寄信或改日曆",
                 sms_time=sms_time,
                 customer_note=customer_note,
+                service_notice=service_notice,
                 status_value="",
                 staff=meta.get("服務人員", "無人力"),
                 service_status=meta.get("服務狀態", "未處理"),
@@ -1773,12 +1778,14 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if not valid_details:
         for detail in row_details:
             sms_time, customer_note = build_time_fields()
+            service_notice = str(detail["payload"].get("notice") or "")
             row_results[detail["row_num"]] = build_row_result(
                 result="失敗",
                 reason="無班表",
                 no_slot_date=detail["date"],
                 sms_time=sms_time,
                 customer_note=customer_note,
+                service_notice=service_notice,
                 status_value="",
                 staff="無人力",
                 service_status="未處理",
@@ -1801,6 +1808,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
     for detail in row_details:
         sms_time, customer_note = build_time_fields()
+        service_notice = str(detail["payload"].get("notice") or "")
 
         if detail["date"] in no_slot_dates:
             row_results[detail["row_num"]] = build_row_result(
@@ -1809,6 +1817,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 no_slot_date=detail["date"],
                 sms_time=sms_time,
                 customer_note=customer_note,
+                service_notice=service_notice,
                 status_value="",
                 staff="無人力",
                 service_status="未處理",
@@ -1821,6 +1830,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 insufficient_date=detail["date"],
                 sms_time=sms_time,
                 customer_note=customer_note,
+                service_notice=service_notice,
                 status_value="",
                 staff=detail.get("section_staff") or "無人力",
                 service_status="未處理",
@@ -1858,6 +1868,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
         order_no = fetch_order_no_by_date_and_period(session, detail["date"], detail["display_period"])
         sms_time, customer_note = build_time_fields()
+        service_notice = str(payload.get("notice") or "")
 
         if not order_no:
             row_results[detail["row_num"]] = build_row_result(
@@ -1865,6 +1876,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                 reason="抓不到訂單編號",
                 sms_time=sms_time,
                 customer_note=customer_note,
+                service_notice=service_notice,
                 status_value="",
                 staff=detail.get("section_staff") or "無人力",
                 service_status="未處理",
@@ -1884,6 +1896,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             reason="",
             sms_time=sms_time,
             customer_note=customer_note,
+            service_notice=service_notice,
             status_value="",
             staff=staff_value,
             service_status=meta.get("服務狀態", "未處理"),
