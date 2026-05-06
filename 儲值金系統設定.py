@@ -573,6 +573,76 @@ def ensure_columns_in_sheet(ws):
     return headers
 
 
+def set_customer_notice_clip_style(ws, headers=None, row_numbers=None):
+    """
+    Google Sheet 顯示規則：
+    客服備註內容完整保留，但儲存格視覺上使用「自動裁剪 / CLIP」，
+    避免長備註自動換行把列高撐高。
+    """
+    try:
+        headers = headers or ws.row_values(1)
+        if "客服備註" not in headers:
+            return
+
+        col_index = headers.index("客服備註")  # 0-based
+        sheet_id = ws.id
+
+        service_account_info = get_service_account_info()
+        creds = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        service = build("sheets", "v4", credentials=creds)
+
+        requests_body = [
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": col_index,
+                        "endColumnIndex": col_index + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "wrapStrategy": "CLIP"
+                        }
+                    },
+                    "fields": "userEnteredFormat.wrapStrategy",
+                }
+            }
+        ]
+
+        # 只固定本次有寫入的資料列，避免長備註撐高列高。
+        # row_numbers 是 Google Sheet 的 1-based row number；API 是 0-based index。
+        if row_numbers:
+            for row_num in sorted(set(int(x) for x in row_numbers if int(x) > 1)):
+                requests_body.append(
+                    {
+                        "updateDimensionProperties": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": row_num - 1,
+                                "endIndex": row_num,
+                            },
+                            "properties": {
+                                "pixelSize": 21
+                            },
+                            "fields": "pixelSize",
+                        }
+                    }
+                )
+
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"requests": requests_body},
+        ).execute()
+
+    except Exception as e:
+        print(f"設定客服備註欄位自動裁剪失敗: {e}")
+
+
 def update_sheet_rows(ws, row_results):
     headers = ensure_columns_in_sheet(ws)
     header_index = {h: i + 1 for i, h in enumerate(headers)}
@@ -607,6 +677,7 @@ def update_sheet_rows(ws, row_results):
 
     if updates:
         ws.batch_update(updates)
+        set_customer_notice_clip_style(ws, headers=headers, row_numbers=row_results.keys())
 
 
 # =========================
@@ -1289,6 +1360,17 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
             return last_purchase.get(key)
         return default
 
+    def pick_address_notice(default=""):
+        # 客服備註必須以「該地址系統預設帶出的備註」為準。
+        # 不使用 lastPurchase.notice，避免抓到會員其他地址或最後一筆訂單的備註。
+        if address_info.get("notice") not in (None, ""):
+            return address_info.get("notice")
+        if old_purchase.get("notice") not in (None, ""):
+            return old_purchase.get("notice")
+        if old_purchase.get("service_notice") not in (None, ""):
+            return old_purchase.get("service_notice")
+        return default
+
     base_memo = ""
     if note_info["need_note"]:
         base_memo = note_info["customer_time_note"] if not base_memo else f"{base_memo}；{note_info['customer_time_note']}"
@@ -1334,7 +1416,7 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
         "cycle": "1",
         "fare": str(address_info.get("fare") or pick("fare", "0") or "0"),
         "memo": base_memo,
-        "notice": str(address_info.get("notice") or pick("notice", "")),
+        "notice": str(pick_address_notice("")),
         "discount_code": "",
         "payway": "4",
         "is_backend": "477",
@@ -1562,11 +1644,15 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     )
     best_addr["fare"] = fare_from_check
 
+    # 客服備註來源修正：
+    # 後台在選定會員地址 / 查詢地區後，應帶出「該地址前一次訂單」的預設備註。
+    # 這裡只接受 check_contain 的 purchase / 該地址 address_info 回傳值，
+    # 不使用 area_info.notice，也不使用 member_payload.lastPurchase.notice，
+    # 避免抓到區域備註、會員其他地址或最後一筆訂單的備註。
     notice_from_check = (
         (purchase_info.get("notice") if purchase_info else "")
         or (purchase_info.get("service_notice") if purchase_info else "")
-        or (area_info.get("notice") if area_info else "")
-        or (area_info.get("service_notice") if area_info else "")
+        or find_nested_value(purchase_info, ["notice", "service_notice", "memo_notice", "customer_service_notice"])
         or best_addr.get("notice", "")
         or ""
     )
