@@ -47,45 +47,75 @@ except Exception:
 # 執行細節 log：完整保留，但 Streamlit 畫面預設收合
 # =========================
 _EXECUTION_DETAIL_LOG = []
+_EXECUTION_DETAIL_CONTEXT = ""
 
 
 def reset_execution_detail_log():
-    global _EXECUTION_DETAIL_LOG
+    global _EXECUTION_DETAIL_LOG, _EXECUTION_DETAIL_CONTEXT
     _EXECUTION_DETAIL_LOG = []
+    _EXECUTION_DETAIL_CONTEXT = ""
+
+
+def set_execution_detail_context(row_num=None, name="", date_text=""):
+    """設定後續 detail_log 所屬列別，讓執行細節可依第 X 列/客戶姓名分框顯示。"""
+    global _EXECUTION_DETAIL_CONTEXT
+    parts = []
+    if row_num not in (None, ""):
+        parts.append(f"第{row_num}列")
+    if str(name or "").strip():
+        parts.append(str(name).strip())
+    if str(date_text or "").strip():
+        parts.append(str(date_text).strip())
+    _EXECUTION_DETAIL_CONTEXT = "｜".join(parts)
 
 
 def _json_safe(value):
     try:
-        json.dumps(value, ensure_ascii=False)
+        json.dumps(value, ensure_ascii=False, default=str)
         return value
     except Exception:
         return str(value)
 
 
 def detail_log(title, data=None):
-    entry = {"title": str(title), "data": _json_safe(data)}
+    entry = {
+        "context": _EXECUTION_DETAIL_CONTEXT or "未標示列別",
+        "title": str(title),
+        "data": _json_safe(data),
+    }
     _EXECUTION_DETAIL_LOG.append(entry)
+    prefix = f"[{entry['context']}] " if entry.get("context") else ""
     if data is None:
-        print(f"[DETAIL] {title}")
+        print(f"[DETAIL] {prefix}{title}")
     else:
         try:
-            print(f"[DETAIL] {title} =", json.dumps(data, ensure_ascii=False, default=str))
+            print(f"[DETAIL] {prefix}{title} =", json.dumps(data, ensure_ascii=False, default=str))
         except Exception:
-            print(f"[DETAIL] {title} = {data}")
+            print(f"[DETAIL] {prefix}{title} = {data}")
 
 
 def render_execution_detail_log():
     if st is None or not _EXECUTION_DETAIL_LOG:
         return
     try:
-        with st.expander("🔍 執行細節（完整保留，點開查看）", expanded=False):
-            for entry in _EXECUTION_DETAIL_LOG:
-                st.markdown(f"**{entry['title']}**")
-                data = entry.get("data")
-                if isinstance(data, (dict, list)):
-                    st.json(data)
-                elif data not in (None, ""):
-                    st.code(str(data))
+        grouped = []
+        context_index = {}
+        for entry in _EXECUTION_DETAIL_LOG:
+            ctx = entry.get("context") or "未標示列別"
+            if ctx not in context_index:
+                context_index[ctx] = len(grouped)
+                grouped.append((ctx, []))
+            grouped[context_index[ctx]][1].append(entry)
+
+        for ctx, entries in grouped:
+            with st.expander(f"🔍 執行細節｜{ctx}", expanded=False):
+                for entry in entries:
+                    st.markdown(f"**{entry['title']}**")
+                    data = entry.get("data")
+                    if isinstance(data, (dict, list)):
+                        st.json(data)
+                    elif data not in (None, ""):
+                        st.code(str(data))
     except Exception:
         pass
 
@@ -910,26 +940,79 @@ def geocode_address(address):
 
 
 def check_contain(session, member_id, address, lat, lng, token, clean_type_id):
-    resp = session.post(
-        CHECK_CONTAIN_URL,
-        data={
-            "memberId": member_id,
-            "cleanTypeId": clean_type_id,
-            "address": address,
-            "lat": lat or "",
-            "lng": lng or "",
-            "_token": token,
+    result, _debug = check_contain_with_debug(session, member_id, address, lat, lng, token, clean_type_id)
+    return result
+
+
+def check_contain_with_debug(session, member_id, address, lat, lng, token, clean_type_id):
+    """
+    模擬後台「查詢地區」。
+    回傳 (json_result, debug_info)，debug_info 會完整保留 request / HTTP / raw response，方便查失敗原因。
+    """
+    data = {
+        "memberId": str(member_id or ""),
+        "cleanTypeId": str(clean_type_id or ""),
+        "address": str(address or ""),
+        "lat": str(lat or ""),
+        "lng": str(lng or ""),
+        "_token": str(token or ""),
+    }
+    debug = {
+        "url": CHECK_CONTAIN_URL,
+        "request": {
+            "memberId": data["memberId"],
+            "cleanTypeId": data["cleanTypeId"],
+            "address": data["address"],
+            "lat": data["lat"],
+            "lng": data["lng"],
+            "token_exists": bool(data["_token"]),
         },
-        headers=HEADERS,
-        allow_redirects=True,
-    )
-    if resp.status_code != 200:
-        return None
+        "http_status": None,
+        "response_text": "",
+        "json_parse_error": "",
+        "json": None,
+        "decision": "",
+    }
 
     try:
-        return resp.json()
-    except Exception:
-        return None
+        resp = session.post(
+            CHECK_CONTAIN_URL,
+            data=data,
+            headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"},
+            allow_redirects=True,
+            timeout=30,
+        )
+        debug["http_status"] = resp.status_code
+        debug["final_url"] = getattr(resp, "url", "")
+        debug["response_text"] = resp.text or ""
+    except Exception as e:
+        debug["decision"] = f"request_exception: {e}"
+        return None, debug
+
+    if resp.status_code != 200:
+        debug["decision"] = f"http_status_not_200: {resp.status_code}"
+        return None, debug
+
+    try:
+        result = resp.json()
+        debug["json"] = result
+    except Exception as e:
+        debug["json_parse_error"] = str(e)
+        debug["decision"] = "response_not_json"
+        return None, debug
+
+    if not isinstance(result, dict):
+        debug["decision"] = "json_not_dict"
+        return result, debug
+
+    if str(result.get("return_code", "")) != "0000":
+        debug["decision"] = f"return_code_not_0000: {result.get('return_code')} / {result.get('description')}"
+    elif not isinstance(result.get("area"), dict) or not result.get("area"):
+        debug["decision"] = "return_code_0000_but_area_empty"
+    else:
+        debug["decision"] = "success"
+
+    return result, debug
 
 
 def calculate_hour(session, order_data, token):
@@ -982,8 +1065,14 @@ def extract_calc_fields(calc_result, fallback_hours="", fallback_fare="0"):
         fare = find_nested_value(calc_result, [
             "fare", "car_fare", "traffic_fee", "trafficFee", "carFare", "車馬費"
         ])
+        tax_total = find_nested_value(calc_result, [
+            "tax_total", "taxTotal", "total_with_tax", "taxTotalPrice", "含稅總額"
+        ])
+        tax_price = find_nested_value(calc_result, [
+            "tax_price", "taxPrice", "price_with_tax", "service_tax_price", "含稅服務費"
+        ])
     else:
-        hour = price = price_vvip = fare = ""
+        hour = price = price_vvip = fare = tax_total = tax_price = ""
 
     raw_text = json.dumps(calc_result, ensure_ascii=False) if isinstance(calc_result, (dict, list)) else str(calc_result or "")
 
@@ -995,12 +1084,21 @@ def extract_calc_fields(calc_result, fallback_hours="", fallback_fare="0"):
         price_vvip = regex_find(raw_text, ["price_vvip", "vvip_price", "vip_price"])
     if not fare:
         fare = regex_find(raw_text, ["fare", "car_fare", "traffic_fee", "trafficFee", "carFare"])
+    if not tax_total:
+        tax_total = regex_find(raw_text, ["tax_total", "taxTotal", "total_with_tax", "taxTotalPrice"])
+    if not tax_price:
+        tax_price = regex_find(raw_text, ["tax_price", "taxPrice", "price_with_tax", "service_tax_price"])
+
+    required_amount = first_nonzero(tax_total, tax_price, price, default="0")
 
     return {
         "hour": str(hour or fallback_hours or ""),
         "price": first_nonzero(price, default="0"),
         "price_vvip": str(price_vvip or "0"),
         "fare": first_nonzero(fare, fallback_fare, default="0"),
+        "tax_total": first_nonzero(tax_total, default="0"),
+        "tax_price": first_nonzero(tax_price, default="0"),
+        "required_amount": required_amount,
     }
 
 
@@ -1572,7 +1670,7 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
 
 
 def filter_dates_by_balance(date_slots, date_prices, available_balance):
-    # 只用服務費 price 判斷；車馬費不列入。
+    # 用 calculate_hour 回傳的 tax_total/required_amount 判斷；車馬費不列入。
     # VIP 可扣款餘額 = 儲值金 + 購物金。
     selected_slots, selected_prices, total = [], [], 0
     for slot, price in zip(date_slots, date_prices):
@@ -1634,7 +1732,7 @@ def get_available_vip_balance(session, member_payload, member_id):
         "shopping_value": shopping,
         "available_balance": total,
         "source": source,
-        "note": "車馬費不列入扣款判斷，只用服務費 price 比對",
+        "note": "車馬費不列入扣款判斷；用 calculate_hour 回傳 tax_total（若無則用 tax_price/price）比對",
     })
     return total, stored, shopping
 
@@ -1744,7 +1842,8 @@ def process_existing_order_only(row, gcal_service, region, session, selected_act
 
 
 def process_one_group(session, rows_with_idx, token, gcal_service, region, backend_user_id=None, selected_actions=None):
-    _, row0 = rows_with_idx[0]
+    first_row_num, row0 = rows_with_idx[0]
+    set_execution_detail_context(first_row_num, str(row0.get("姓名", "")).strip(), get_date_str(row0["日期"]))
 
     purchase_item = str(row0["購買項目"]).strip()
     clean_type_id = CLEAN_TYPE_MAP.get(purchase_item)
@@ -1792,7 +1891,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if not str(best_addr.get("lat") or "").strip() or not str(best_addr.get("lng") or "").strip():
         raise Exception(f"地址定位失敗，無法查詢地區：{selected_address}")
 
-    addr_check = check_contain(
+    addr_check, addr_check_debug = check_contain_with_debug(
         session,
         member.get("member_id", ""),
         selected_address,
@@ -1801,17 +1900,28 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         token,
         clean_type_id,
     )
+    detail_log("📍 查詢地區 request/response", addr_check_debug)
     detail_log("check_contain raw", addr_check)
 
     if not isinstance(addr_check, dict):
-        raise Exception(f"查詢地區失敗：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，回傳不是 JSON")
+        raise Exception(
+            f"查詢地區失敗：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，"
+            f"原因={addr_check_debug.get('decision')}，HTTP={addr_check_debug.get('http_status')}"
+        )
     if str(addr_check.get("return_code", "")) != "0000":
-        raise Exception(f"查詢地區失敗：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，return_code={addr_check.get('return_code')}，description={addr_check.get('description')}")
+        raise Exception(
+            f"查詢地區失敗：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，"
+            f"return_code={addr_check.get('return_code')}，description={addr_check.get('description')}，"
+            f"HTTP={addr_check_debug.get('http_status')}"
+        )
 
     area_info = addr_check.get("area") if isinstance(addr_check.get("area"), dict) else {}
     purchase_info = addr_check.get("purchase") if isinstance(addr_check.get("purchase"), dict) else {}
     if not area_info:
-        raise Exception(f"查詢地區成功但沒有 area：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，raw={addr_check}")
+        raise Exception(
+            f"查詢地區成功但沒有 area：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，"
+            f"decision={addr_check_debug.get('decision')}，raw={addr_check}"
+        )
 
     if area_info:
         best_addr["area_id"] = area_info.get("area_id", best_addr.get("area_id"))
@@ -1932,9 +2042,12 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
         detail_log("🟣 calc_fields", calc_fields)
         payload["fare"] = first_nonzero(calc_fields.get("fare"), best_addr.get("fare"), base_data.get("fare"), default="0")
+        payload["_required_balance_amount"] = str(calc_fields.get("required_amount") or calc_fields.get("tax_total") or calc_fields.get("tax_price") or calc_fields.get("price") or "0")
 
         if str(payload.get("price", "")).strip() in ("", "0", "0.0"):
             raise Exception(f"計算時數後 price 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
+        if str(payload.get("_required_balance_amount", "")).strip() in ("", "0", "0.0"):
+            raise Exception(f"計算時數後 tax_total/required_amount 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
 
         payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
         payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
@@ -1945,13 +2058,15 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     row_details = []
     for row_num, row in rows_with_idx:
         date_s = get_date_str(row["日期"])
+        set_execution_detail_context(row_num, str(row.get("姓名", "")).strip(), date_s)
         priced_payload = build_priced_payload_for_date(date_s)
+        required_amount = parse_money_value(priced_payload.get("_required_balance_amount"), default=0)
 
         row_details.append({
             "row_num": row_num,
             "date": date_s,
             "slot": f"{date_s}_{system_period}",
-            "price": int(float(priced_payload.get("price") or 0)),  # 只拿服務費比對儲值金
+            "price": required_amount,  # 用 tax_total/含稅金額比對儲值金+購物金；車馬費不列入
             "display_period": system_display_period,
             "row": row,
             "payload": priced_payload,
@@ -1963,7 +2078,9 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             "system_period": system_period,
             "slot": f"{date_s}_{system_period}",
             "price": priced_payload.get("price"),
+            "tax_total_required_amount": priced_payload.get("_required_balance_amount"),
             "fare": priced_payload.get("fare"),
+            "balance_rule": "儲值金 + 購物金 >= tax_total_required_amount；車馬費不列入",
         })
 
     need_create_order = has_action(selected_actions, "建單")
@@ -2011,6 +2128,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     valid_details = []
 
     for detail in row_details:
+        set_execution_detail_context(detail["row_num"], str(detail["row"].get("姓名", "")).strip(), detail["date"])
         raw = get_section_raw(session, detail["payload"], token, detail["slot"])
         slot_ok = slot_exists_in_section_response(raw, detail["slot"])
         cleaners = extract_cleaners_from_section_response(raw, detail["slot"])
@@ -2061,6 +2179,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             insufficient_dates.append(detail["date"])
 
     for detail in row_details:
+        set_execution_detail_context(detail["row_num"], str(detail["row"].get("姓名", "")).strip(), detail["date"])
         sms_time, customer_note = build_time_fields()
         service_notice = str(detail["payload"].get("notice") or "")
 
@@ -2096,6 +2215,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
     # 每筆單獨送出，避免日期互相污染
     for detail in send_details:
+        set_execution_detail_context(detail["row_num"], str(detail["row"].get("姓名", "")).strip(), detail["date"])
         payload = detail["payload"].copy()
         slots = [detail["slot"]]
 
@@ -2104,6 +2224,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                   "date": detail["date"],
                   "slot": detail["slot"],
                   "price": payload.get("price"),
+                  "tax_total_required_amount": payload.get("_required_balance_amount"),
                   "fare": payload.get("fare"),
                   "addressId": payload.get("addressId"),
                   "area_id": payload.get("area_id"),
