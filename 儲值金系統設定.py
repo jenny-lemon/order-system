@@ -284,6 +284,29 @@ def get_unit_price_by_date(date_value):
     return 700 if is_weekend(date_value) else 600
 
 
+def calc_expected_service_total(date_value, people, hours):
+    """
+    VIP 儲值金排程扣款規則：
+    服務總額 = 人數 * 服務人時 * 單價。
+    平日單價 600，週末單價 700。車馬費不列入扣款判斷。
+    這個金額是含稅服務費，用來和「儲值金 + 購物金」比較。
+    """
+    unit_price = get_unit_price_by_date(date_value)
+    try:
+        total = float(people) * float(hours) * float(unit_price)
+    except Exception:
+        total = 0
+    return int(round(total)), unit_price
+
+
+def calc_pre_tax_price_from_tax_total(tax_total):
+    """後台 price 欄位通常是不含稅服務費；tax_total 是含稅服務費。"""
+    amount = parse_money_value(tax_total, default=0)
+    if amount <= 0:
+        return 0
+    return int(round(amount / 1.05))
+
+
 def parse_time_slot(start_time_str, end_time_str):
     if not str(start_time_str).strip() or not str(end_time_str).strip():
         raise Exception(f"開始時間或結束時間為空：{start_time_str} / {end_time_str}")
@@ -909,34 +932,99 @@ def pick_best_address_info(member_payload, target_address):
 
 
 def geocode_address(address):
-    if not GOOGLE_MAPS_API_KEY:
-        return None, None
+    """先用一般 Geocoding API；失敗時改用後台頁面相同的 Google JS GeocodeService.Search。"""
+    debug = {
+        "address": str(address or ""),
+        "api_key_exists": bool(str(GOOGLE_MAPS_API_KEY or "").strip()),
+        "normal_api": {},
+        "js_api": {},
+        "final_lat": "",
+        "final_lng": "",
+    }
 
-    try:
-        url = "https://maps.googleapis.com/maps/api/geocode/json"
-        params = {
-            "address": address,
-            "language": "zh-TW",
-            "key": GOOGLE_MAPS_API_KEY,
-        }
-        resp = requests.get(url, params=params, timeout=15)
-        if resp.status_code != 200:
-            return None, None
-
-        data = resp.json()
-        results = data.get("results", [])
-        if not results:
-            return None, None
-
-        location = results[0].get("geometry", {}).get("location", {})
-        lat = location.get("lat")
-        lng = location.get("lng")
+    def finish(lat, lng):
+        debug["final_lat"] = "" if lat is None else str(lat)
+        debug["final_lng"] = "" if lng is None else str(lng)
+        try:
+            detail_log("🗺️ 地址定位 geocode", debug)
+        except Exception:
+            pass
         if lat is None or lng is None:
             return None, None
-
         return str(lat), str(lng)
-    except Exception:
-        return None, None
+
+    maps_key = str(GOOGLE_MAPS_API_KEY or "").strip()
+
+    # 1) 標準 Geocoding API
+    if maps_key:
+        try:
+            url = "https://maps.googleapis.com/maps/api/geocode/json"
+            params = {
+                "address": address,
+                "language": "zh-TW",
+                "key": maps_key,
+            }
+            resp = requests.get(url, params=params, timeout=15)
+            debug["normal_api"] = {
+                "url": url,
+                "http_status": resp.status_code,
+                "text_preview": resp.text[:500],
+            }
+            if resp.status_code == 200:
+                data = resp.json()
+                debug["normal_api"]["status"] = data.get("status")
+                results = data.get("results", [])
+                if results:
+                    location = results[0].get("geometry", {}).get("location", {})
+                    lat = location.get("lat")
+                    lng = location.get("lng")
+                    if lat is not None and lng is not None:
+                        return finish(lat, lng)
+        except Exception as e:
+            debug["normal_api"]["error"] = str(e)
+
+    # 2) 後台頁面使用的 Google JS GeocodeService.Search
+    # 這支是瀏覽器 JS API 使用的 endpoint；若 env 沒設 key，就用後台頁面公開 key fallback。
+    js_key = maps_key or "AIzaSyB_LWQGJzwV-rQfP0cfeGPl2PEyhk9pw5Y"
+    try:
+        url = "https://maps.googleapis.com/maps/api/js/GeocodeService.Search"
+        params = {
+            "4s": address,
+            "9s": "zh-TW",
+            "r_url": f"{BASE_URL}/booking/stored_value_routine",
+            "callback": "_xdc_._lcgeo",
+            "key": js_key,
+            "token": str(int(time.time()))[-6:],
+        }
+        headers = {
+            "accept": "*/*",
+            "referer": BASE_URL + "/",
+            "user-agent": HEADERS.get("User-Agent", "Mozilla/5.0"),
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        text = resp.text or ""
+        debug["js_api"] = {
+            "url": resp.url,
+            "http_status": resp.status_code,
+            "text_preview": text[:1000],
+        }
+
+        # 常見格式裡會出現 lat/lng 或 [lat,lng]。優先用 key-value regex。
+        m = re.search(r'"lat"\s*:\s*(-?\d+(?:\.\d+)?).*?"lng"\s*:\s*(-?\d+(?:\.\d+)?)', text, flags=re.S)
+        if m:
+            return finish(m.group(1), m.group(2))
+
+        # JS GeocodeService 有時用陣列存座標，找最像台灣座標的一組。
+        nums = [float(x) for x in re.findall(r'-?\d+\.\d+', text)]
+        for i in range(len(nums) - 1):
+            lat, lng = nums[i], nums[i + 1]
+            if 21 <= lat <= 26 and 119 <= lng <= 123:
+                return finish(lat, lng)
+
+    except Exception as e:
+        debug["js_api"]["error"] = str(e)
+
+    return finish(None, None)
 
 
 def check_contain(session, member_id, address, lat, lng, token, clean_type_id):
@@ -1670,7 +1758,7 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
 
 
 def filter_dates_by_balance(date_slots, date_prices, available_balance):
-    # 用 calculate_hour 回傳的 tax_total/required_amount 判斷；車馬費不列入。
+    # 用 Google Sheet 規則計算的含稅服務總額判斷；車馬費不列入。
     # VIP 可扣款餘額 = 儲值金 + 購物金。
     selected_slots, selected_prices, total = [], [], 0
     for slot, price in zip(date_slots, date_prices):
@@ -1732,7 +1820,7 @@ def get_available_vip_balance(session, member_payload, member_id):
         "shopping_value": shopping,
         "available_balance": total,
         "source": source,
-        "note": "車馬費不列入扣款判斷；用 calculate_hour 回傳 tax_total（若無則用 tax_price/price）比對",
+        "note": "車馬費不列入扣款判斷；用 Google Sheet 規則：人數 * 小時 * 平日600/週末700 比對",
     })
     return total, stored, shopping
 
@@ -2088,21 +2176,34 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             fallback_fare=best_addr.get("fare", "0"),
         )
 
+        expected_total, unit_price = calc_expected_service_total(date_s, people, hours)
+        expected_price = calc_pre_tax_price_from_tax_total(expected_total)
+
+        calc_fields["sheet_expected_total"] = str(expected_total)
+        calc_fields["sheet_unit_price"] = str(unit_price)
+        calc_fields["sheet_expected_price"] = str(expected_price)
+        calc_fields["balance_rule"] = "儲值金 + 購物金 >= Google Sheet 規則含稅服務總額；車馬費不列入"
+        calc_fields["calculate_hour_tax_total_note"] = (
+            "僅供 debug。若後台 calculate_hour 回傳與 Sheet 規則不同，"
+            "扣款判斷與送單 price 以 Sheet 規則為準。"
+        )
+
         payload = base_data.copy()
         payload["date_s"] = date_s
         payload["hour"] = str(base_data.get("hour") or calc_fields.get("hour") or "")
         payload["person"] = str(base_data.get("person") or payload.get("person") or "")
-        payload["price"] = str(calc_fields.get("price") or "0")
+        payload["price"] = str(expected_price or calc_fields.get("price") or "0")
         payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
 
         detail_log("🟣 calc_fields", calc_fields)
         payload["fare"] = first_nonzero(calc_fields.get("fare"), best_addr.get("fare"), base_data.get("fare"), default="0")
-        payload["_required_balance_amount"] = str(calc_fields.get("required_amount") or calc_fields.get("tax_total") or calc_fields.get("tax_price") or calc_fields.get("price") or "0")
+        payload["_required_balance_amount"] = str(expected_total)
+        payload["_backend_required_balance_amount"] = str(calc_fields.get("required_amount") or calc_fields.get("tax_total") or calc_fields.get("tax_price") or calc_fields.get("price") or "0")
 
         if str(payload.get("price", "")).strip() in ("", "0", "0.0"):
-            raise Exception(f"計算時數後 price 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
+            raise Exception(f"計算服務費後 price 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
         if str(payload.get("_required_balance_amount", "")).strip() in ("", "0", "0.0"):
-            raise Exception(f"計算時數後 tax_total/required_amount 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
+            raise Exception(f"Sheet 規則服務總額仍為 0，請貼 👥 parsed person/hour 與 🟣 calc_fields：{date_s}")
 
         payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
         payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
@@ -2121,7 +2222,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             "row_num": row_num,
             "date": date_s,
             "slot": f"{date_s}_{system_period}",
-            "price": required_amount,  # 用 tax_total/含稅金額比對儲值金+購物金；車馬費不列入
+            "price": required_amount,  # 用 Sheet 規則含稅服務總額比對儲值金+購物金；車馬費不列入
             "display_period": system_display_period,
             "row": row,
             "payload": priced_payload,
@@ -2133,9 +2234,10 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             "system_period": system_period,
             "slot": f"{date_s}_{system_period}",
             "price": priced_payload.get("price"),
-            "tax_total_required_amount": priced_payload.get("_required_balance_amount"),
+            "sheet_required_amount": priced_payload.get("_required_balance_amount"),
+            "backend_calculate_hour_required_amount": priced_payload.get("_backend_required_balance_amount"),
             "fare": priced_payload.get("fare"),
-            "balance_rule": "儲值金 + 購物金 >= tax_total_required_amount；車馬費不列入",
+            "balance_rule": "儲值金 + 購物金 >= sheet_required_amount；車馬費不列入",
         })
 
     need_create_order = has_action(selected_actions, "建單")
@@ -2279,7 +2381,8 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
                   "date": detail["date"],
                   "slot": detail["slot"],
                   "price": payload.get("price"),
-                  "tax_total_required_amount": payload.get("_required_balance_amount"),
+                  "sheet_required_amount": payload.get("_required_balance_amount"),
+                  "backend_calculate_hour_required_amount": payload.get("_backend_required_balance_amount"),
                   "fare": payload.get("fare"),
                   "addressId": payload.get("addressId"),
                   "area_id": payload.get("area_id"),
