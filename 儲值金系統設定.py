@@ -1875,20 +1875,75 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     available_balance, stored_value, shopping_value = get_available_vip_balance(session, member_payload, member_id)
 
     target_address = str(row0["地址"]).strip().split(",")[0]
+    member_address_list = member.get("memberAddressList", []) if isinstance(member, dict) else []
+    address_candidates = []
+    for item in member_address_list[:20]:
+        if isinstance(item, dict):
+            address_candidates.append({
+                "id": item.get("id"),
+                "address": item.get("address"),
+                "lat": item.get("lat"),
+                "lng": item.get("lng"),
+                "match": normalize_addr_for_match(item.get("address", "")) == normalize_addr_for_match(target_address),
+            })
+
+    detail_log("🏠 下拉地址比對", {
+        "target_address": target_address,
+        "member_id": member_id,
+        "member_address_count": len(member_address_list),
+        "candidates_preview": address_candidates,
+        "rule": "必須從 memberAddressList 完全符合的下拉地址取 addressId 與客服備註",
+    })
+
     best_addr = pick_best_address_info(member_payload, target_address)
     if not best_addr:
-        raise Exception("找不到對應地址資料")
+        detail_log("❌ 下拉地址失敗", {
+            "target_address": target_address,
+            "member_id": member_id,
+            "member_address_count": len(member_address_list),
+            "candidates_preview": address_candidates,
+        })
+        raise Exception(f"找不到對應下拉地址：{target_address}")
     if not str(best_addr.get("addressId", "")).strip():
+        detail_log("❌ 下拉地址缺少 addressId", {
+            "target_address": target_address,
+            "selected_address": best_addr.get("address"),
+            "best_addr": best_addr,
+        })
         raise Exception(f"地址存在但未選到下拉地址，缺少 addressId：{target_address}")
 
     selected_address = str(best_addr.get("address") or target_address).strip()
+    before_lat = str(best_addr.get("lat") or "").strip()
+    before_lng = str(best_addr.get("lng") or "").strip()
 
     geo_lat, geo_lng = geocode_address(selected_address)
     if geo_lat and geo_lng:
         best_addr["lat"] = geo_lat
         best_addr["lng"] = geo_lng
 
-    if not str(best_addr.get("lat") or "").strip() or not str(best_addr.get("lng") or "").strip():
+    final_lat = str(best_addr.get("lat") or "").strip()
+    final_lng = str(best_addr.get("lng") or "").strip()
+    detail_log("📌 地址定位檢查", {
+        "selected_address": selected_address,
+        "addressId": best_addr.get("addressId"),
+        "dropdown_lat": before_lat,
+        "dropdown_lng": before_lng,
+        "geocode_lat": geo_lat,
+        "geocode_lng": geo_lng,
+        "final_lat": final_lat,
+        "final_lng": final_lng,
+        "will_call_check_contain": bool(final_lat and final_lng),
+    })
+
+    if not final_lat or not final_lng:
+        detail_log("❌ 地址定位失敗", {
+            "selected_address": selected_address,
+            "addressId": best_addr.get("addressId"),
+            "dropdown_lat": before_lat,
+            "dropdown_lng": before_lng,
+            "geocode_lat": geo_lat,
+            "geocode_lng": geo_lng,
+        })
         raise Exception(f"地址定位失敗，無法查詢地區：{selected_address}")
 
     addr_check, addr_check_debug = check_contain_with_debug(
