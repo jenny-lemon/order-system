@@ -98,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-05-03-final-staff-notice-aa ===")
+print("=== 儲值金系統設定.py 版本：2026-05-06-dropdown-address-check-region-blank-no-order ===")
 
 
 # =========================
@@ -406,8 +406,20 @@ def should_create_order(row):
 # =========================
 # XYZ / 回填模板
 # =========================
-def finalize_xyz(meta=None, fallback_fare="0"):
+def finalize_xyz(meta=None, fallback_fare="0", order_no=""):
+    """
+    X/Y/Z 欄位規則：
+    - 有成立訂單（有訂單編號）時，才補預設值：無人力 / 未處理 / 0。
+    - 沒有成立訂單時，X/Y/Z 必須保持空白，避免誤以為已成立訂單。
+    """
     meta = meta or {}
+
+    if not str(order_no or "").strip():
+        return {
+            "服務人員": "",
+            "服務狀態": "",
+            "車馬費": "",
+        }
 
     staff = str(meta.get("服務人員", "") or "").strip()
     status = str(meta.get("服務狀態", "") or "").strip()
@@ -442,10 +454,18 @@ def build_row_result(
     calendar_old="",
     calendar_new="",
     status_value="",
-    staff="無人力",
-    service_status="未處理",
-    fare="0",
+    staff="",
+    service_status="",
+    fare="",
 ):
+    # 沒有訂單編號＝沒有成立訂單。
+    # 此時 X/Y/Z/AA（服務人員、服務狀態、車馬費、客服備註）全部空白。
+    if not str(order_no or "").strip():
+        staff = ""
+        service_status = ""
+        fare = ""
+        service_notice = ""
+
     xyz = finalize_xyz(
         {
             "服務人員": staff,
@@ -453,6 +473,7 @@ def build_row_result(
             "車馬費": fare,
         },
         fallback_fare=fare or "0",
+        order_no=order_no,
     )
 
     return {
@@ -573,7 +594,6 @@ def ensure_columns_in_sheet(ws):
     return headers
 
 
-
 def set_customer_notice_clip_style(ws, headers=None, row_numbers=None):
     """
     Google Sheet 顯示規則：
@@ -643,12 +663,16 @@ def set_customer_notice_clip_style(ws, headers=None, row_numbers=None):
     except Exception as e:
         print(f"設定客服備註欄位自動裁剪失敗: {e}")
 
+
 def update_sheet_rows(ws, row_results):
     headers = ensure_columns_in_sheet(ws)
     header_index = {h: i + 1 for i, h in enumerate(headers)}
     updates = []
 
     for row_num, info in row_results.items():
+        order_no = str(info.get("訂單編號", "") or "").strip()
+        if not order_no:
+            info["客服備註"] = ""
         xyz = finalize_xyz(
             {
                 "服務人員": info.get("服務人員", ""),
@@ -656,6 +680,7 @@ def update_sheet_rows(ws, row_results):
                 "車馬費": info.get("車馬費", ""),
             },
             fallback_fare=info.get("車馬費", "0"),
+            order_no=order_no,
         )
         info["服務人員"] = xyz["服務人員"]
         info["服務狀態"] = xyz["服務狀態"]
@@ -798,33 +823,17 @@ def geocode_address(address):
         return None, None
 
 
-def check_contain(session, member_id, address, lat, lng, token, clean_type_id, address_id=""):
-    """
-    模擬後台「選下拉地址」後按「查詢地址」。
-    客服備註是跟著下拉地址，車馬費是按查詢地址後才會帶出，
-    所以這支一定要帶 addressId / memberAddressId 類欄位一起送。
-    """
-    data = {
-        "memberId": member_id,
-        "cleanTypeId": clean_type_id,
-        "address": address,
-        "lat": lat or "",
-        "lng": lng or "",
-        "_token": token,
-    }
-
-    if str(address_id or "").strip():
-        # 不同頁面/JS 版本可能讀不同欄位名；多送同值通常後台會忽略不認得的欄位。
-        data.update({
-            "addressId": str(address_id).strip(),
-            "address_id": str(address_id).strip(),
-            "memberAddressId": str(address_id).strip(),
-            "member_address_id": str(address_id).strip(),
-        })
-
+def check_contain(session, member_id, address, lat, lng, token, clean_type_id):
     resp = session.post(
         CHECK_CONTAIN_URL,
-        data=data,
+        data={
+            "memberId": member_id,
+            "cleanTypeId": clean_type_id,
+            "address": address,
+            "lat": lat or "",
+            "lng": lng or "",
+            "_token": token,
+        },
         headers=HEADERS,
         allow_redirects=True,
     )
@@ -1369,23 +1378,22 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
     old_purchase = address_info.get("purchase", {}) if isinstance(address_info, dict) else {}
 
     def pick(key, default=""):
-        # 只能用「下拉地址本身」或「查詢地址後」回填的 purchase。
-        # 不使用 member_payload.lastPurchase，避免抓到會員其他地址的上一筆備註/資料。
+        # 完整下拉地址規則：
+        # 只使用 memberAddressList 中「被選中的該地址」自己的 purchase。
+        # 不使用 member_payload.lastPurchase，避免抓到客人其他地址或最後一筆訂單。
         if old_purchase.get(key) not in (None, ""):
             return old_purchase.get(key)
         return default
 
     def pick_address_notice(default=""):
-        # 客服備註必須跟著下拉地址。
-        # 來源順序：查詢地址後 best_addr.notice -> 該下拉地址 purchase.notice/service_notice。
+        # 客服備註必須以「該地址系統預設帶出的備註」為準。
+        # 不使用 lastPurchase.notice，避免抓到會員其他地址或最後一筆訂單的備註。
         if address_info.get("notice") not in (None, ""):
             return address_info.get("notice")
-        for key in ("notice", "service_notice", "memo_notice", "customer_service_notice"):
-            if old_purchase.get(key) not in (None, ""):
-                return old_purchase.get(key)
-        nested = find_nested_value(old_purchase, ["notice", "service_notice", "memo_notice", "customer_service_notice", "客服備註"])
-        if nested not in (None, ""):
-            return nested
+        if old_purchase.get("notice") not in (None, ""):
+            return old_purchase.get("notice")
+        if old_purchase.get("service_notice") not in (None, ""):
+            return old_purchase.get("service_notice")
         return default
 
     base_memo = ""
@@ -1405,8 +1413,7 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
         "memoFinance": str(member.get("memo_finance") or ""),
         "addressId": str(address_info.get("addressId") or ""),
         "country_id": str(address_info.get("country_id") or pick("country_id", "12")),
-        # 一定用下拉地址本身，不用 Sheet 地址字串，才會跟後台選址狀態一致。
-        "address": str(address_info.get("address") or row["地址"]).strip(),
+        "address": str(row["地址"]).strip(),
         "ping": str(pick("ping", "4")),
         "room": str(pick("room", "0")),
         "bathroom": str(pick("bathroom", "0")),
@@ -1610,22 +1617,6 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         raise Exception(f"地址存在但未選到下拉地址，缺少 addressId：{target_address}")
 
     selected_address = str(best_addr.get("address") or target_address).strip()
-    selected_address_id = str(best_addr.get("addressId") or "").strip()
-    if not selected_address_id:
-        raise Exception(f"沒有選到下拉地址 addressId，無法帶出客服備註：{selected_address}")
-
-    print("[DEBUG] selected dropdown address =", {
-        "addressId": selected_address_id,
-        "address": selected_address,
-    })
-    try:
-        if st is not None:
-            st.write("🏠 selected dropdown address =", {
-                "addressId": selected_address_id,
-                "address": selected_address,
-            })
-    except Exception:
-        pass
 
     geo_lat, geo_lng = geocode_address(selected_address)
     if geo_lat and geo_lng:
@@ -1640,7 +1631,6 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         best_addr.get("lng", ""),
         token,
         clean_type_id,
-        best_addr.get("addressId", ""),
     )
     if not addr_check:
         raise Exception(f"查詢地址/地區失敗：{selected_address}")
@@ -1661,10 +1651,11 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         best_addr["company_id"] = area_info.get("company_id", best_addr.get("company_id"))
         best_addr["country_id"] = area_info.get("country_id", best_addr.get("country_id"))
 
-    if purchase_info:
-        best_addr["purchase"] = purchase_info
+    # 注意：purchase_info 來自「查詢地區」回傳。
+    # 客服備註不可改用這裡的 purchase_info，否則多地址客人可能被覆蓋。
+    # 客服備註只跟著前面已選中的下拉地址 best_addr["purchase"]。
 
-    # 模擬後台「查詢地址」後的資料補齊：
+    # 模擬後台「查詢地區」後的資料補齊：
     # 車馬費可能在 purchase、area 或巢狀欄位中，需全部掃描。
     fare_from_check = first_nonzero(
         purchase_info.get("fare") if purchase_info else "",
@@ -1679,19 +1670,17 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     )
     best_addr["fare"] = fare_from_check
 
-    # 客服備註是「下拉地址」帶出的，不是區域備註，也不是會員最後一筆訂單。
-    # 因此只吃：查詢地址後 purchase 內的備註，或下拉地址 item 原本附帶的 purchase 備註。
-    selected_purchase = best_addr.get("purchase", {}) if isinstance(best_addr.get("purchase"), dict) else {}
-    notice_from_check = (
-        (purchase_info.get("notice") if purchase_info else "")
-        or (purchase_info.get("service_notice") if purchase_info else "")
-        or find_nested_value(purchase_info, ["notice", "service_notice", "memo_notice", "customer_service_notice", "客服備註"])
-        or selected_purchase.get("notice", "")
-        or selected_purchase.get("service_notice", "")
-        or find_nested_value(selected_purchase, ["notice", "service_notice", "memo_notice", "customer_service_notice", "客服備註"])
+    # 客服備註來源：完整下拉地址。
+    # 必須來自 memberAddressList 中完全符合地址的那筆 purchase。
+    # 「查詢地區」只更新區域與車馬費，不覆蓋客服備註。
+    selected_address_purchase = best_addr.get("purchase", {}) if isinstance(best_addr.get("purchase"), dict) else {}
+    selected_address_notice = (
+        selected_address_purchase.get("notice")
+        or selected_address_purchase.get("service_notice")
+        or find_nested_value(selected_address_purchase, ["notice", "service_notice", "memo_notice", "customer_service_notice"])
         or ""
     )
-    best_addr["notice"] = notice_from_check
+    best_addr["notice"] = selected_address_notice
 
     base_data = prepare_base_order_data(
         row0,
