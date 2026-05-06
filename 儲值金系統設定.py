@@ -6,6 +6,7 @@ import time
 import html
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -984,29 +985,37 @@ def geocode_address(address):
             debug["normal_api"]["error"] = str(e)
 
     # 2) 後台頁面使用的 Google JS GeocodeService.Search
-    # 這支是瀏覽器 JS API 使用的 endpoint；若 env 沒設 key，就用後台頁面公開 key fallback。
+    # 注意：這支 endpoint 的前兩個參數不是標準 key=value。
+    # 瀏覽器實際送出格式是：...?4s<encoded_address>&9szh-TW&...
+    # 如果用 requests params={"4s": address} 會變成 4s=<address>，Google 會回 403。
     js_key = maps_key or "AIzaSyB_LWQGJzwV-rQfP0cfeGPl2PEyhk9pw5Y"
     try:
-        url = "https://maps.googleapis.com/maps/api/js/GeocodeService.Search"
-        params = {
-            "4s": address,
-            "9s": "zh-TW",
-            "r_url": f"{BASE_URL}/booking/stored_value_routine",
-            "callback": "_xdc_._lcgeo",
-            "key": js_key,
-            "token": str(int(time.time()))[-6:],
-        }
+        encoded_addr = quote(str(address or ""), safe="")
+        encoded_r_url = quote(f"{BASE_URL}/booking/stored_value_routine", safe="")
+        token_text = str(int(time.time() * 1000))[-6:]
+        url = (
+            "https://maps.googleapis.com/maps/api/js/GeocodeService.Search"
+            f"?4s{encoded_addr}"
+            "&9szh-TW"
+            f"&r_url={encoded_r_url}"
+            "&callback=_xdc_._lcgeo"
+            f"&key={js_key}"
+            f"&token={token_text}"
+        )
         headers = {
             "accept": "*/*",
+            "accept-language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "referer": BASE_URL + "/",
             "user-agent": HEADERS.get("User-Agent", "Mozilla/5.0"),
         }
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=15)
         text = resp.text or ""
         debug["js_api"] = {
-            "url": resp.url,
+            "url": url,
             "http_status": resp.status_code,
-            "text_preview": text[:1000],
+            "text_preview": text[:1500],
+            "key_source": "env" if maps_key else "backend_public_fallback",
+            "query_format": "4s<encoded_address>&9szh-TW",
         }
 
         # 常見格式裡會出現 lat/lng 或 [lat,lng]。優先用 key-value regex。
