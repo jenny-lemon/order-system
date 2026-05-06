@@ -98,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-05-06-dropdown-address-check-region-blank-no-order ===")
+print("=== 儲值金系統設定.py 版本：2026-05-06-dropdown-address-notice-v2 ===")
 
 
 # =========================
@@ -156,6 +156,60 @@ def find_nested_value(obj, keys):
                 return found
 
     return ""
+
+
+ADDRESS_NOTICE_KEYS = [
+    # 後台常見英文欄位
+    "notice", "service_notice", "serviceNotice",
+    "memo_notice", "memoNotice",
+    "customer_service_notice", "customerServiceNotice",
+    "cs_notice", "csNotice",
+    "address_notice", "addressNotice",
+    "backend_notice", "backendNotice",
+    "clean_notice", "cleanNotice",
+    "order_notice", "orderNotice",
+    "remark", "remarks", "note",
+    # 有些資料會把客服備註放在 memo 類欄位
+    "memo", "memo_process", "memoProcess",
+    # 中文欄位保險
+    "客服備註", "地址備註", "備註",
+]
+
+
+def extract_address_notice(*sources):
+    """
+    從「選中的下拉地址」相關資料中抓客服備註。
+    重點：先傳入 memberAddressList 中完全符合的 raw item，再傳 purchase；
+    若後台把欄位名稱改成 addressNotice / memoProcess 等，也能抓到。
+    """
+    for source in sources:
+        if not isinstance(source, (dict, list)):
+            continue
+        value = find_nested_value(source, ADDRESS_NOTICE_KEYS)
+        text = str(value or "").strip()
+        if text and text not in ("0", "0.0", "nan", "None"):
+            return text
+    return ""
+
+
+def preview_dict_keys(obj, max_items=80):
+    """Debug 用：列出巢狀 key，避免整包個資印太多。"""
+    found = []
+
+    def walk(x, prefix=""):
+        if len(found) >= max_items:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                path = f"{prefix}.{k}" if prefix else str(k)
+                found.append(path)
+                walk(v, path)
+        elif isinstance(x, list):
+            for i, item in enumerate(x[:3]):
+                walk(item, f"{prefix}[{i}]")
+
+    walk(obj)
+    return found[:max_items]
 
 
 def parse_date_value(date_value):
@@ -778,6 +832,7 @@ def pick_best_address_info(member_payload, target_address):
     for item in member_address_list:
         item_addr = str(item.get("address", "")).strip()
         if normalize_addr_for_match(item_addr) == target_norm:
+            purchase = item.get("purchase", {}) if isinstance(item.get("purchase"), dict) else {}
             return {
                 "addressId": str(item.get("id", "")).strip(),
                 "country_id": item.get("countryId", ""),
@@ -786,7 +841,9 @@ def pick_best_address_info(member_payload, target_address):
                 "lat": item.get("lat", ""),
                 "lng": item.get("lng", ""),
                 "company_id": item.get("companyId", 1),
-                "purchase": item.get("purchase", {}) if isinstance(item.get("purchase"), dict) else {},
+                "purchase": purchase,
+                "notice": extract_address_notice(item, purchase),
+                "_raw_address_item": item,
             }
 
     return {}
@@ -1387,14 +1444,14 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
 
     def pick_address_notice(default=""):
         # 客服備註必須以「該地址系統預設帶出的備註」為準。
+        # 優先順序：完整下拉地址 raw item → 該地址 purchase → 已整理出的 notice。
         # 不使用 lastPurchase.notice，避免抓到會員其他地址或最後一筆訂單的備註。
-        if address_info.get("notice") not in (None, ""):
-            return address_info.get("notice")
-        if old_purchase.get("notice") not in (None, ""):
-            return old_purchase.get("notice")
-        if old_purchase.get("service_notice") not in (None, ""):
-            return old_purchase.get("service_notice")
-        return default
+        value = extract_address_notice(
+            address_info.get("_raw_address_item"),
+            old_purchase,
+            {"notice": address_info.get("notice", "")},
+        )
+        return value or default
 
     base_memo = ""
     if note_info["need_note"]:
@@ -1671,16 +1728,37 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     best_addr["fare"] = fare_from_check
 
     # 客服備註來源：完整下拉地址。
-    # 必須來自 memberAddressList 中完全符合地址的那筆 purchase。
-    # 「查詢地區」只更新區域與車馬費，不覆蓋客服備註。
+    # 必須先從 memberAddressList 中完全符合地址的 raw item / purchase 抓。
+    # 若 raw item 沒有帶到，才從「查詢地區」回傳補抓一次。
+    # 不使用 member_payload.lastPurchase，避免多地址客人抓錯。
     selected_address_purchase = best_addr.get("purchase", {}) if isinstance(best_addr.get("purchase"), dict) else {}
-    selected_address_notice = (
-        selected_address_purchase.get("notice")
-        or selected_address_purchase.get("service_notice")
-        or find_nested_value(selected_address_purchase, ["notice", "service_notice", "memo_notice", "customer_service_notice"])
-        or ""
+    selected_address_raw = best_addr.get("_raw_address_item", {}) if isinstance(best_addr.get("_raw_address_item"), dict) else {}
+    selected_address_notice = extract_address_notice(
+        selected_address_raw,
+        selected_address_purchase,
+        purchase_info,
+        addr_check,
     )
     best_addr["notice"] = selected_address_notice
+
+    print("[DEBUG] selected address notice =", {
+        "addressId": best_addr.get("addressId"),
+        "notice_len": len(str(selected_address_notice or "")),
+        "raw_address_keys": preview_dict_keys(selected_address_raw),
+        "address_purchase_keys": preview_dict_keys(selected_address_purchase),
+        "check_contain_purchase_keys": preview_dict_keys(purchase_info),
+    })
+    try:
+        if st is not None:
+            st.write("📝 selected address notice =", {
+                "addressId": best_addr.get("addressId"),
+                "notice_len": len(str(selected_address_notice or "")),
+                "raw_address_keys": preview_dict_keys(selected_address_raw),
+                "address_purchase_keys": preview_dict_keys(selected_address_purchase),
+                "check_contain_purchase_keys": preview_dict_keys(purchase_info),
+            })
+    except Exception:
+        pass
 
     base_data = prepare_base_order_data(
         row0,
@@ -1708,6 +1786,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         "area_id": base_data.get("area_id"),
         "company_id": base_data.get("company_id"),
         "fare": base_data.get("fare"),
+        "notice_len": len(str(base_data.get("notice") or "")),
         "lat": base_data.get("lat"),
         "lng": base_data.get("lng"),
     })
