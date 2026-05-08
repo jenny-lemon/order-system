@@ -1410,7 +1410,7 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
         return default
 
     def pick_address_notice(default=""):
-        # 客服備註必須以「該地址系統預設帶出的備註」為準。
+        # 客服備註必須以「下拉地址對應的前次訂單客服備註」為準。
         # 不使用 lastPurchase.notice，避免抓到會員其他地址或最後一筆訂單的備註。
         if address_info.get("notice") not in (None, ""):
             return address_info.get("notice")
@@ -1675,8 +1675,9 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         best_addr["company_id"] = area_info.get("company_id", best_addr.get("company_id"))
         best_addr["country_id"] = area_info.get("country_id", best_addr.get("country_id"))
 
-    if purchase_info:
-        best_addr["purchase"] = purchase_info
+    # 注意：check_contain 回傳的 purchase 通常是付款/發票資訊，
+    # 不是「下拉地址前一次訂單」的客服備註來源。
+    # 所以不能覆蓋 best_addr["purchase"]，否則會把下拉地址 purchase.notice 洗掉。
 
     # 模擬後台「查詢地址」後的資料補齊：
     # 車馬費可能在 purchase、area 或巢狀欄位中，需全部掃描。
@@ -1698,11 +1699,19 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     # 這裡只接受 check_contain 的 purchase / 該地址 address_info 回傳值，
     # 不使用 area_info.notice，也不使用 member_payload.lastPurchase.notice，
     # 避免抓到區域備註、會員其他地址或最後一筆訂單的備註。
+    dropdown_purchase = best_addr.get("purchase", {}) if isinstance(best_addr.get("purchase"), dict) else {}
+    notice_from_dropdown_purchase = (
+        dropdown_purchase.get("notice")
+        or dropdown_purchase.get("service_notice")
+        or find_nested_value(dropdown_purchase, ["notice", "service_notice", "memo_notice", "customer_service_notice"])
+        or ""
+    )
     notice_from_check = (
-        (purchase_info.get("notice") if purchase_info else "")
+        notice_from_dropdown_purchase
+        or best_addr.get("notice", "")
+        or (purchase_info.get("notice") if purchase_info else "")
         or (purchase_info.get("service_notice") if purchase_info else "")
         or find_nested_value(purchase_info, ["notice", "service_notice", "memo_notice", "customer_service_notice"])
-        or best_addr.get("notice", "")
         or ""
     )
     best_addr["notice"] = notice_from_check
