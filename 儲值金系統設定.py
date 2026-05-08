@@ -6,7 +6,6 @@ import time
 import html
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -42,83 +41,6 @@ try:
     from env import GOOGLE_MAPS_API_KEY
 except Exception:
     GOOGLE_MAPS_API_KEY = ""
-
-
-# =========================
-# 執行細節 log：完整保留，但 Streamlit 畫面預設收合
-# =========================
-_EXECUTION_DETAIL_LOG = []
-_EXECUTION_DETAIL_CONTEXT = ""
-
-
-def reset_execution_detail_log():
-    global _EXECUTION_DETAIL_LOG, _EXECUTION_DETAIL_CONTEXT
-    _EXECUTION_DETAIL_LOG = []
-    _EXECUTION_DETAIL_CONTEXT = ""
-
-
-def set_execution_detail_context(row_num=None, name="", date_text=""):
-    """設定後續 detail_log 所屬列別，讓執行細節可依第 X 列/客戶姓名分框顯示。"""
-    global _EXECUTION_DETAIL_CONTEXT
-    parts = []
-    if row_num not in (None, ""):
-        parts.append(f"第{row_num}列")
-    if str(name or "").strip():
-        parts.append(str(name).strip())
-    if str(date_text or "").strip():
-        parts.append(str(date_text).strip())
-    _EXECUTION_DETAIL_CONTEXT = "｜".join(parts)
-
-
-def _json_safe(value):
-    try:
-        json.dumps(value, ensure_ascii=False, default=str)
-        return value
-    except Exception:
-        return str(value)
-
-
-def detail_log(title, data=None):
-    entry = {
-        "context": _EXECUTION_DETAIL_CONTEXT or "未標示列別",
-        "title": str(title),
-        "data": _json_safe(data),
-    }
-    _EXECUTION_DETAIL_LOG.append(entry)
-    prefix = f"[{entry['context']}] " if entry.get("context") else ""
-    if data is None:
-        print(f"[DETAIL] {prefix}{title}")
-    else:
-        try:
-            print(f"[DETAIL] {prefix}{title} =", json.dumps(data, ensure_ascii=False, default=str))
-        except Exception:
-            print(f"[DETAIL] {prefix}{title} = {data}")
-
-
-def render_execution_detail_log():
-    if st is None or not _EXECUTION_DETAIL_LOG:
-        return
-    try:
-        grouped = []
-        context_index = {}
-        for entry in _EXECUTION_DETAIL_LOG:
-            ctx = entry.get("context") or "未標示列別"
-            if ctx not in context_index:
-                context_index[ctx] = len(grouped)
-                grouped.append((ctx, []))
-            grouped[context_index[ctx]][1].append(entry)
-
-        for ctx, entries in grouped:
-            with st.expander(f"🔍 執行細節｜{ctx}", expanded=False):
-                for entry in entries:
-                    st.markdown(f"**{entry['title']}**")
-                    data = entry.get("data")
-                    if isinstance(data, (dict, list)):
-                        st.json(data)
-                    elif data not in (None, ""):
-                        st.code(str(data))
-    except Exception:
-        pass
 
 
 # =========================
@@ -176,7 +98,7 @@ KNOWN_SERVICE_STATUS = [
     "待處理",
 ]
 
-print("=== 儲值金系統設定.py 版本：2026-05-06-final-balance-staff-log ===")
+print("=== 儲值金系統設定.py 版本：2026-05-03-final-staff-notice-aa ===")
 
 
 # =========================
@@ -212,25 +134,6 @@ def first_nonzero(*values, default="0"):
         if text not in ("", "0", "0.0", "nan", "None"):
             return text
     return str(default)
-
-
-def parse_money_value(value, default=0):
-    text = str(value if value is not None else "").strip()
-    if text in ("", "nan", "None", "NULL"):
-        return default
-    text = text.replace(",", "")
-    m = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not m:
-        return default
-    try:
-        return int(float(m.group(0)))
-    except Exception:
-        return default
-
-
-def extract_nested_money(obj, keys, default=0):
-    value = find_nested_value(obj, keys)
-    return parse_money_value(value, default=default)
 
 
 def find_nested_value(obj, keys):
@@ -283,29 +186,6 @@ def is_weekend(date_value):
 
 def get_unit_price_by_date(date_value):
     return 700 if is_weekend(date_value) else 600
-
-
-def calc_expected_service_total(date_value, people, hours):
-    """
-    VIP 儲值金排程扣款規則：
-    服務總額 = 人數 * 服務人時 * 單價。
-    平日單價 600，週末單價 700。車馬費不列入扣款判斷。
-    這個金額是含稅服務費，用來和「儲值金 + 購物金」比較。
-    """
-    unit_price = get_unit_price_by_date(date_value)
-    try:
-        total = float(people) * float(hours) * float(unit_price)
-    except Exception:
-        total = 0
-    return int(round(total)), unit_price
-
-
-def calc_pre_tax_price_from_tax_total(tax_total):
-    """後台 price 欄位通常是不含稅服務費；tax_total 是含稅服務費。"""
-    amount = parse_money_value(tax_total, default=0)
-    if amount <= 0:
-        return 0
-    return int(round(amount / 1.05))
 
 
 def parse_time_slot(start_time_str, end_time_str):
@@ -529,7 +409,8 @@ def should_create_order(row):
 def finalize_xyz(meta=None, fallback_fare="0"):
     meta = meta or {}
 
-    staff = str(meta.get("服務人員", "") or "").strip()
+    staff_raw = str(meta.get("服務人員", "") or "").strip()
+    staff = normalize_staff_display(staff_raw) if staff_raw else ""
     status = str(meta.get("服務狀態", "") or "").strip()
     fare = str(meta.get("車馬費", "") or "").strip()
 
@@ -769,24 +650,17 @@ def update_sheet_rows(ws, row_results):
     updates = []
 
     for row_num, info in row_results.items():
-        # 沒有成立訂單時，X/Y/Z/AA（服務人員、服務狀態、車馬費、客服備註）保持空白。
-        if not str(info.get("訂單編號", "") or "").strip():
-            info["服務人員"] = ""
-            info["服務狀態"] = ""
-            info["車馬費"] = ""
-            info["客服備註"] = ""
-        else:
-            xyz = finalize_xyz(
-                {
-                    "服務人員": info.get("服務人員", ""),
-                    "服務狀態": info.get("服務狀態", ""),
-                    "車馬費": info.get("車馬費", ""),
-                },
-                fallback_fare=info.get("車馬費", "0"),
-            )
-            info["服務人員"] = xyz["服務人員"]
-            info["服務狀態"] = xyz["服務狀態"]
-            info["車馬費"] = xyz["車馬費"]
+        xyz = finalize_xyz(
+            {
+                "服務人員": info.get("服務人員", ""),
+                "服務狀態": info.get("服務狀態", ""),
+                "車馬費": info.get("車馬費", ""),
+            },
+            fallback_fare=info.get("車馬費", "0"),
+        )
+        info["服務人員"] = xyz["服務人員"]
+        info["服務狀態"] = xyz["服務狀態"]
+        info["車馬費"] = xyz["車馬費"]
 
         for key, value in info.items():
             if key not in header_index:
@@ -868,40 +742,9 @@ def get_member(session, phone, token, clean_type_id):
     return result if isinstance(result, dict) and result.get("return_code") == "0000" and result.get("member") else None
 
 
-def flatten_keys(obj, prefix=""):
-    keys = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            keys.append(path)
-            keys.extend(flatten_keys(value, path))
-    elif isinstance(obj, list):
-        for idx, item in enumerate(obj):
-            path = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
-            keys.extend(flatten_keys(item, path))
-    return keys
-
-
-def extract_address_notice_from_obj(obj):
-    """
-    客服備註跟著下拉地址。
-    後台欄位名稱不固定，所以只從「選中的下拉地址原始物件」與其 purchase 內遞迴找。
-    """
-    preferred_keys = [
-        "notice", "service_notice", "memo_notice", "customer_service_notice",
-        "memoProcess", "memo_process", "customerNotice", "customer_notice",
-        "notice_service", "serviceNotice",
-    ]
-    value = find_nested_value(obj, preferred_keys)
-    if value not in (None, ""):
-        return str(value)
-    return ""
-
-
 def pick_best_address_info(member_payload, target_address):
     """
-    強制以真正下拉地址為主；沒有 addressId 視為沒選到下拉地址。
-    客服備註只從選中的下拉地址原始物件 / 該地址 purchase 取，不用 lastPurchase。
+    強制以真正下拉地址為主；沒有 addressId 視為沒選到下拉地址
     """
     member = member_payload.get("member", {}) if isinstance(member_payload, dict) else {}
     member_address_list = member.get("memberAddressList", []) if isinstance(member, dict) else []
@@ -911,9 +754,6 @@ def pick_best_address_info(member_payload, target_address):
     for item in member_address_list:
         item_addr = str(item.get("address", "")).strip()
         if normalize_addr_for_match(item_addr) == target_norm:
-            purchase = item.get("purchase", {}) if isinstance(item.get("purchase"), dict) else {}
-            raw_item = item.copy() if isinstance(item, dict) else {}
-            notice = extract_address_notice_from_obj({"address": raw_item, "purchase": purchase})
             return {
                 "addressId": str(item.get("id", "")).strip(),
                 "country_id": item.get("countryId", ""),
@@ -922,194 +762,64 @@ def pick_best_address_info(member_payload, target_address):
                 "lat": item.get("lat", ""),
                 "lng": item.get("lng", ""),
                 "company_id": item.get("companyId", 1),
-                "purchase": purchase,
-                "raw_address": raw_item,
-                "notice": notice,
-                "raw_address_keys": flatten_keys(raw_item)[:120],
-                "address_purchase_keys": flatten_keys(purchase)[:120],
+                "purchase": item.get("purchase", {}) if isinstance(item.get("purchase"), dict) else {},
             }
 
     return {}
 
 
 def geocode_address(address):
-    """先用一般 Geocoding API；失敗時改用後台頁面相同的 Google JS GeocodeService.Search。"""
-    debug = {
-        "address": str(address or ""),
-        "api_key_exists": bool(str(GOOGLE_MAPS_API_KEY or "").strip()),
-        "normal_api": {},
-        "js_api": {},
-        "final_lat": "",
-        "final_lng": "",
-    }
+    if not GOOGLE_MAPS_API_KEY:
+        return None, None
 
-    def finish(lat, lng):
-        debug["final_lat"] = "" if lat is None else str(lat)
-        debug["final_lng"] = "" if lng is None else str(lng)
-        try:
-            detail_log("🗺️ 地址定位 geocode", debug)
-        except Exception:
-            pass
+    try:
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {
+            "address": address,
+            "language": "zh-TW",
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None, None
+
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return None, None
+
+        location = results[0].get("geometry", {}).get("location", {})
+        lat = location.get("lat")
+        lng = location.get("lng")
         if lat is None or lng is None:
             return None, None
+
         return str(lat), str(lng)
-
-    maps_key = str(GOOGLE_MAPS_API_KEY or "").strip()
-
-    # 1) 標準 Geocoding API
-    if maps_key:
-        try:
-            url = "https://maps.googleapis.com/maps/api/geocode/json"
-            params = {
-                "address": address,
-                "language": "zh-TW",
-                "key": maps_key,
-            }
-            resp = requests.get(url, params=params, timeout=15)
-            debug["normal_api"] = {
-                "url": url,
-                "http_status": resp.status_code,
-                "text_preview": resp.text[:500],
-            }
-            if resp.status_code == 200:
-                data = resp.json()
-                debug["normal_api"]["status"] = data.get("status")
-                results = data.get("results", [])
-                if results:
-                    location = results[0].get("geometry", {}).get("location", {})
-                    lat = location.get("lat")
-                    lng = location.get("lng")
-                    if lat is not None and lng is not None:
-                        return finish(lat, lng)
-        except Exception as e:
-            debug["normal_api"]["error"] = str(e)
-
-    # 2) 後台頁面使用的 Google JS GeocodeService.Search
-    # 注意：這支 endpoint 的前兩個參數不是標準 key=value。
-    # 瀏覽器實際送出格式是：...?4s<encoded_address>&9szh-TW&...
-    # 如果用 requests params={"4s": address} 會變成 4s=<address>，Google 會回 403。
-    js_key = maps_key or "AIzaSyB_LWQGJzwV-rQfP0cfeGPl2PEyhk9pw5Y"
-    try:
-        encoded_addr = quote(str(address or ""), safe="")
-        encoded_r_url = quote(f"{BASE_URL}/booking/stored_value_routine", safe="")
-        token_text = str(int(time.time() * 1000))[-6:]
-        url = (
-            "https://maps.googleapis.com/maps/api/js/GeocodeService.Search"
-            f"?4s{encoded_addr}"
-            "&9szh-TW"
-            f"&r_url={encoded_r_url}"
-            "&callback=_xdc_._lcgeo"
-            f"&key={js_key}"
-            f"&token={token_text}"
-        )
-        headers = {
-            "accept": "*/*",
-            "accept-language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "referer": BASE_URL + "/",
-            "user-agent": HEADERS.get("User-Agent", "Mozilla/5.0"),
-        }
-        resp = requests.get(url, headers=headers, timeout=15)
-        text = resp.text or ""
-        debug["js_api"] = {
-            "url": url,
-            "http_status": resp.status_code,
-            "text_preview": text[:1500],
-            "key_source": "env" if maps_key else "backend_public_fallback",
-            "query_format": "4s<encoded_address>&9szh-TW",
-        }
-
-        # 常見格式裡會出現 lat/lng 或 [lat,lng]。優先用 key-value regex。
-        m = re.search(r'"lat"\s*:\s*(-?\d+(?:\.\d+)?).*?"lng"\s*:\s*(-?\d+(?:\.\d+)?)', text, flags=re.S)
-        if m:
-            return finish(m.group(1), m.group(2))
-
-        # JS GeocodeService 有時用陣列存座標，找最像台灣座標的一組。
-        nums = [float(x) for x in re.findall(r'-?\d+\.\d+', text)]
-        for i in range(len(nums) - 1):
-            lat, lng = nums[i], nums[i + 1]
-            if 21 <= lat <= 26 and 119 <= lng <= 123:
-                return finish(lat, lng)
-
-    except Exception as e:
-        debug["js_api"]["error"] = str(e)
-
-    return finish(None, None)
+    except Exception:
+        return None, None
 
 
 def check_contain(session, member_id, address, lat, lng, token, clean_type_id):
-    result, _debug = check_contain_with_debug(session, member_id, address, lat, lng, token, clean_type_id)
-    return result
-
-
-def check_contain_with_debug(session, member_id, address, lat, lng, token, clean_type_id):
-    """
-    模擬後台「查詢地區」。
-    回傳 (json_result, debug_info)，debug_info 會完整保留 request / HTTP / raw response，方便查失敗原因。
-    """
-    data = {
-        "memberId": str(member_id or ""),
-        "cleanTypeId": str(clean_type_id or ""),
-        "address": str(address or ""),
-        "lat": str(lat or ""),
-        "lng": str(lng or ""),
-        "_token": str(token or ""),
-    }
-    debug = {
-        "url": CHECK_CONTAIN_URL,
-        "request": {
-            "memberId": data["memberId"],
-            "cleanTypeId": data["cleanTypeId"],
-            "address": data["address"],
-            "lat": data["lat"],
-            "lng": data["lng"],
-            "token_exists": bool(data["_token"]),
+    resp = session.post(
+        CHECK_CONTAIN_URL,
+        data={
+            "memberId": member_id,
+            "cleanTypeId": clean_type_id,
+            "address": address,
+            "lat": lat or "",
+            "lng": lng or "",
+            "_token": token,
         },
-        "http_status": None,
-        "response_text": "",
-        "json_parse_error": "",
-        "json": None,
-        "decision": "",
-    }
-
-    try:
-        resp = session.post(
-            CHECK_CONTAIN_URL,
-            data=data,
-            headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"},
-            allow_redirects=True,
-            timeout=30,
-        )
-        debug["http_status"] = resp.status_code
-        debug["final_url"] = getattr(resp, "url", "")
-        debug["response_text"] = resp.text or ""
-    except Exception as e:
-        debug["decision"] = f"request_exception: {e}"
-        return None, debug
-
+        headers=HEADERS,
+        allow_redirects=True,
+    )
     if resp.status_code != 200:
-        debug["decision"] = f"http_status_not_200: {resp.status_code}"
-        return None, debug
+        return None
 
     try:
-        result = resp.json()
-        debug["json"] = result
-    except Exception as e:
-        debug["json_parse_error"] = str(e)
-        debug["decision"] = "response_not_json"
-        return None, debug
-
-    if not isinstance(result, dict):
-        debug["decision"] = "json_not_dict"
-        return result, debug
-
-    if str(result.get("return_code", "")) != "0000":
-        debug["decision"] = f"return_code_not_0000: {result.get('return_code')} / {result.get('description')}"
-    elif not isinstance(result.get("area"), dict) or not result.get("area"):
-        debug["decision"] = "return_code_0000_but_area_empty"
-    else:
-        debug["decision"] = "success"
-
-    return result, debug
+        return resp.json()
+    except Exception:
+        return None
 
 
 def calculate_hour(session, order_data, token):
@@ -1162,14 +872,8 @@ def extract_calc_fields(calc_result, fallback_hours="", fallback_fare="0"):
         fare = find_nested_value(calc_result, [
             "fare", "car_fare", "traffic_fee", "trafficFee", "carFare", "車馬費"
         ])
-        tax_total = find_nested_value(calc_result, [
-            "tax_total", "taxTotal", "total_with_tax", "taxTotalPrice", "含稅總額"
-        ])
-        tax_price = find_nested_value(calc_result, [
-            "tax_price", "taxPrice", "price_with_tax", "service_tax_price", "含稅服務費"
-        ])
     else:
-        hour = price = price_vvip = fare = tax_total = tax_price = ""
+        hour = price = price_vvip = fare = ""
 
     raw_text = json.dumps(calc_result, ensure_ascii=False) if isinstance(calc_result, (dict, list)) else str(calc_result or "")
 
@@ -1181,21 +885,12 @@ def extract_calc_fields(calc_result, fallback_hours="", fallback_fare="0"):
         price_vvip = regex_find(raw_text, ["price_vvip", "vvip_price", "vip_price"])
     if not fare:
         fare = regex_find(raw_text, ["fare", "car_fare", "traffic_fee", "trafficFee", "carFare"])
-    if not tax_total:
-        tax_total = regex_find(raw_text, ["tax_total", "taxTotal", "total_with_tax", "taxTotalPrice"])
-    if not tax_price:
-        tax_price = regex_find(raw_text, ["tax_price", "taxPrice", "price_with_tax", "service_tax_price"])
-
-    required_amount = first_nonzero(tax_total, tax_price, price, default="0")
 
     return {
         "hour": str(hour or fallback_hours or ""),
         "price": first_nonzero(price, default="0"),
         "price_vvip": str(price_vvip or "0"),
         "fare": first_nonzero(fare, fallback_fare, default="0"),
-        "tax_total": first_nonzero(tax_total, default="0"),
-        "tax_price": first_nonzero(tax_price, default="0"),
-        "required_amount": required_amount,
     }
 
 
@@ -1263,42 +958,63 @@ def extract_cleaners_from_section_response(raw_text, date_slot):
 
 def clean_staff_name(name):
     """
-    將後台/班表的人員文字整理成純姓名。
+    將班表/訂單頁的人名清成純姓名。
     例：
+    - 00洪暐智(4) -> 洪暐智
+    - X蔡佩玲(1) -> 蔡佩玲
     - ＊黃惟芊 -> 黃惟芊
-    - 00紀至聰(5) -> 紀至聰
-    - 郭清松(1) -> 郭清松
+    - 吳豐閔 X X蔡佩玲 -> 會在 normalize_staff_display 再統一成 吳豐閔 X 蔡佩玲
     """
-    text = str(name or "").strip()
+    text = html.unescape(str(name or "")).strip()
     if not text:
         return ""
 
-    text = text.replace("＊", "").replace("*", "").strip()
+    text = text.strip().lstrip("＊*").strip()
+    text = re.sub(r"^[Xx×＊*\s]+", "", text).strip()
     text = re.sub(r"^\d+", "", text).strip()
     text = re.sub(r"[（(]\d+[）)]", "", text).strip()
-    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"^[Xx×\s]+", "", text).strip()
+    text = re.sub(r"[Xx×\s]+$", "", text).strip()
     return text
 
 
-def format_staff_from_cleaners(cleaners, people=None):
+def normalize_staff_display(value, limit=None):
+    """
+    X欄顯示規則：名字和名字中間只保留一個「 X 」。
+    不管來源是 list、已經串好的字串、或含有 X姓名，都先拆開、清洗、再重組。
+    """
+    if value in (None, ""):
+        return ""
+
+    if isinstance(value, (list, tuple)):
+        raw_parts = []
+        for item in value:
+            raw_parts.extend(re.split(r"\s*[Xx×]\s*|[,，、/]+", str(item or "")))
+    else:
+        raw_parts = re.split(r"\s*[Xx×]\s*|[,，、/]+", str(value or ""))
+
     cleaned = []
-    for name in cleaners or []:
-        text = clean_staff_name(name)
-        if text and text not in cleaned:
-            cleaned.append(text)
+    seen = set()
+    for part in raw_parts:
+        name = clean_staff_name(part)
+        if not name or name in seen:
+            continue
+        cleaned.append(name)
+        seen.add(name)
+        if limit and len(cleaned) >= int(limit):
+            break
 
-    if not cleaned:
-        return "無人力"
+    return " X ".join(cleaned)
 
+
+def format_staff_from_cleaners(cleaners, people=None):
     try:
-        limit = int(float(people)) if people not in (None, "") else 0
+        limit = int(people) if people not in (None, "") else None
     except Exception:
-        limit = 0
+        limit = None
 
-    if limit > 0:
-        cleaned = cleaned[:limit]
-
-    return " X ".join(cleaned) if cleaned else "無人力"
+    staff = normalize_staff_display(cleaners or [], limit=limit)
+    return staff if staff else "無人力"
 
 
 def slot_exists_in_section_response(raw_text, date_slot):
@@ -1403,26 +1119,21 @@ def fetch_order_no_by_date_and_period(session, target_date, target_period):
 
 
 def _extract_staff_line(lines):
-    """
-    從訂單列表卡片解析實際服務人員。
-    只回傳純姓名，移除前綴數字與後綴括號編號。
-    支援：
-    - 紀至聰(5) X 郭清松(1) X 黃惟芊(2)
-    - 00蔡立娟(5) X 楊超顯(5)
-    """
     joined = "\n".join(lines)
     normalized = normalize_text_for_parse(joined)
 
-    # 優先抓「姓名(數字) X 姓名(數字) ...」這種實際已派工人員格式。
-    candidates = re.findall(r'(?:\d{0,3})?[\u4e00-\u9fffA-Za-z]{2,12}[（(]\d+[）)]', normalized)
-    names = []
-    for item in candidates:
-        name = clean_staff_name(item)
-        if name and name not in names:
-            names.append(name)
+    m = re.search(r'([\u4e00-\u9fffA-Za-z0-9]+\(\d+\))X([\u4e00-\u9fffA-Za-z0-9]+\(\d+\))', normalized)
+    if m:
+        return normalize_staff_display([m.group(1), m.group(2)])
 
-    if names:
-        return " X ".join(names)
+    for i, line in enumerate(lines):
+        t = normalize_text_for_parse(line)
+        if re.search(r'\(\d+\)X$', t):
+            first = re.sub(r'X$', '', t)
+            if i + 1 < len(lines):
+                second = normalize_text_for_parse(lines[i + 1])
+                if re.search(r'\(\d+\)$', second):
+                    return normalize_staff_display([first, second])
 
     return "無人力"
 
@@ -1688,25 +1399,25 @@ def sync_calendar_color_for_row(service, calendar_id, address, date_value, start
 # =========================
 def prepare_base_order_data(row, member_payload, address_info, clean_type_id, people, hours, system_period, note_info):
     member = member_payload.get("member", {}) if isinstance(member_payload, dict) else {}
+    last_purchase = member_payload.get("lastPurchase", {}) if isinstance(member_payload, dict) else {}
     old_purchase = address_info.get("purchase", {}) if isinstance(address_info, dict) else {}
 
     def pick(key, default=""):
         if old_purchase.get(key) not in (None, ""):
             return old_purchase.get(key)
+        if last_purchase.get(key) not in (None, ""):
+            return last_purchase.get(key)
         return default
 
     def pick_address_notice(default=""):
-        # 客服備註必須以「該下拉地址系統預設帶出的備註」為準。
-        # 不使用 member_payload.lastPurchase.notice，避免抓到會員其他地址或最後一筆訂單的備註。
-        value = address_info.get("notice")
-        if value not in (None, ""):
-            return value
-        value = extract_address_notice_from_obj({
-            "address": address_info.get("raw_address", {}),
-            "purchase": old_purchase,
-        })
-        if value not in (None, ""):
-            return value
+        # 客服備註必須以「該地址系統預設帶出的備註」為準。
+        # 不使用 lastPurchase.notice，避免抓到會員其他地址或最後一筆訂單的備註。
+        if address_info.get("notice") not in (None, ""):
+            return address_info.get("notice")
+        if old_purchase.get("notice") not in (None, ""):
+            return old_purchase.get("notice")
+        if old_purchase.get("service_notice") not in (None, ""):
+            return old_purchase.get("service_notice")
         return default
 
     base_memo = ""
@@ -1766,72 +1477,15 @@ def prepare_base_order_data(row, member_payload, address_info, clean_type_id, pe
     }
 
 
-def filter_dates_by_balance(date_slots, date_prices, available_balance):
-    # 用 Google Sheet 規則計算的含稅服務總額判斷；車馬費不列入。
-    # VIP 可扣款餘額 = 儲值金 + 購物金。
+def filter_dates_by_balance(date_slots, date_prices, stored_value):
+    # 只用服務費 price 判斷，車馬費不算在儲值金
     selected_slots, selected_prices, total = [], [], 0
     for slot, price in zip(date_slots, date_prices):
-        price = parse_money_value(price, default=0)
-        if total + price <= available_balance:
+        if total + price <= stored_value:
             selected_slots.append(slot)
             selected_prices.append(price)
             total += price
     return selected_slots, selected_prices, total
-
-
-def fetch_vip_balance_from_page(session, member_id):
-    """從儲值金歷程頁解析儲值金餘額與購物金餘額。"""
-    if not member_id:
-        return 0, 0, "no member_id"
-
-    urls = [
-        f"{BASE_URL}/member/{member_id}/stored_value_histories",
-        f"{BASE_URL}/member/{member_id}/stored_value",
-        f"{BASE_URL}/member/{member_id}",
-    ]
-    for url in urls:
-        try:
-            resp = session.get(url, headers=HEADERS, allow_redirects=True, timeout=20)
-        except Exception:
-            continue
-        if resp.status_code != 200 or not resp.text:
-            continue
-        text = BeautifulSoup(resp.text, "html.parser").get_text("\n", strip=True)
-        m_stored = re.search(r"儲值金餘額[：:]\s*([\d,]+)", text)
-        m_shopping = re.search(r"購物金餘額[：:]\s*([\d,]+)", text)
-        if m_stored or m_shopping:
-            return (
-                parse_money_value(m_stored.group(1) if m_stored else 0),
-                parse_money_value(m_shopping.group(1) if m_shopping else 0),
-                url,
-            )
-    return 0, 0, "not found"
-
-
-def get_available_vip_balance(session, member_payload, member_id):
-    # 先吃 get_member 可能已回傳的欄位；若沒有購物金，再抓儲值金歷程頁。
-    stored = extract_nested_money(member_payload, ["storedValue", "stored_value", "儲值金餘額"], default=0)
-    shopping = extract_nested_money(member_payload, [
-        "shoppingValue", "shopping_value", "shoppingMoney", "shopping_money",
-        "bonus", "bonusValue", "point", "points", "購物金餘額", "購物金",
-    ], default=0)
-
-    source = "get_member"
-    page_stored, page_shopping, page_source = fetch_vip_balance_from_page(session, member_id)
-    if page_stored or page_shopping:
-        stored = page_stored
-        shopping = page_shopping
-        source = page_source
-
-    total = stored + shopping
-    detail_log("VIP balance", {
-        "stored_value": stored,
-        "shopping_value": shopping,
-        "available_balance": total,
-        "source": source,
-        "note": "車馬費不列入扣款判斷；用 Google Sheet 規則：人數 * 小時 * 平日600/週末700 比對",
-    })
-    return total, stored, shopping
 
 
 def stage_send_confirmation(order_no, session):
@@ -1939,8 +1593,7 @@ def process_existing_order_only(row, gcal_service, region, session, selected_act
 
 
 def process_one_group(session, rows_with_idx, token, gcal_service, region, backend_user_id=None, selected_actions=None):
-    first_row_num, row0 = rows_with_idx[0]
-    set_execution_detail_context(first_row_num, str(row0.get("姓名", "")).strip(), get_date_str(row0["日期"]))
+    _, row0 = rows_with_idx[0]
 
     purchase_item = str(row0["購買項目"]).strip()
     clean_type_id = CLEAN_TYPE_MAP.get(purchase_item)
@@ -1955,12 +1608,22 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     if hours is None:
         raise Exception("無法判斷服務時數")
 
-    detail_log("👥 parsed person/hour", {
+    print("[DEBUG] parsed person/hour =", {
         "服務人時": str(row0["服務人時"]),
         "sheet_time": normalize_period_text(row0["開始時間"], row0["結束時間"]),
         "person": people,
         "hour": hours,
     })
+    try:
+        if st is not None:
+            st.write("👥 parsed person/hour =", {
+                "服務人時": str(row0["服務人時"]),
+                "sheet_time": normalize_period_text(row0["開始時間"], row0["結束時間"]),
+                "person": people,
+                "hour": hours,
+            })
+    except Exception:
+        pass
 
     phone = normalize_phone(row0["電話"])
     member_payload = get_member(session, phone, token, clean_type_id)
@@ -1968,82 +1631,23 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         raise Exception(f"會員不存在: {phone}")
 
     member = member_payload.get("member", {})
-    member_id = str(member.get("member_id") or member.get("id") or "")
-    available_balance, stored_value, shopping_value = get_available_vip_balance(session, member_payload, member_id)
+    stored_value = int(float(member_payload.get("storedValue", 0) or 0))
 
     target_address = str(row0["地址"]).strip().split(",")[0]
-    member_address_list = member.get("memberAddressList", []) if isinstance(member, dict) else []
-    address_candidates = []
-    for item in member_address_list[:20]:
-        if isinstance(item, dict):
-            address_candidates.append({
-                "id": item.get("id"),
-                "address": item.get("address"),
-                "lat": item.get("lat"),
-                "lng": item.get("lng"),
-                "match": normalize_addr_for_match(item.get("address", "")) == normalize_addr_for_match(target_address),
-            })
-
-    detail_log("🏠 下拉地址比對", {
-        "target_address": target_address,
-        "member_id": member_id,
-        "member_address_count": len(member_address_list),
-        "candidates_preview": address_candidates,
-        "rule": "必須從 memberAddressList 完全符合的下拉地址取 addressId 與客服備註",
-    })
-
     best_addr = pick_best_address_info(member_payload, target_address)
     if not best_addr:
-        detail_log("❌ 下拉地址失敗", {
-            "target_address": target_address,
-            "member_id": member_id,
-            "member_address_count": len(member_address_list),
-            "candidates_preview": address_candidates,
-        })
-        raise Exception(f"找不到對應下拉地址：{target_address}")
+        raise Exception("找不到對應地址資料")
     if not str(best_addr.get("addressId", "")).strip():
-        detail_log("❌ 下拉地址缺少 addressId", {
-            "target_address": target_address,
-            "selected_address": best_addr.get("address"),
-            "best_addr": best_addr,
-        })
         raise Exception(f"地址存在但未選到下拉地址，缺少 addressId：{target_address}")
 
     selected_address = str(best_addr.get("address") or target_address).strip()
-    before_lat = str(best_addr.get("lat") or "").strip()
-    before_lng = str(best_addr.get("lng") or "").strip()
 
     geo_lat, geo_lng = geocode_address(selected_address)
     if geo_lat and geo_lng:
         best_addr["lat"] = geo_lat
         best_addr["lng"] = geo_lng
 
-    final_lat = str(best_addr.get("lat") or "").strip()
-    final_lng = str(best_addr.get("lng") or "").strip()
-    detail_log("📌 地址定位檢查", {
-        "selected_address": selected_address,
-        "addressId": best_addr.get("addressId"),
-        "dropdown_lat": before_lat,
-        "dropdown_lng": before_lng,
-        "geocode_lat": geo_lat,
-        "geocode_lng": geo_lng,
-        "final_lat": final_lat,
-        "final_lng": final_lng,
-        "will_call_check_contain": bool(final_lat and final_lng),
-    })
-
-    if not final_lat or not final_lng:
-        detail_log("❌ 地址定位失敗", {
-            "selected_address": selected_address,
-            "addressId": best_addr.get("addressId"),
-            "dropdown_lat": before_lat,
-            "dropdown_lng": before_lng,
-            "geocode_lat": geo_lat,
-            "geocode_lng": geo_lng,
-        })
-        raise Exception(f"地址定位失敗，無法查詢地區：{selected_address}")
-
-    addr_check, addr_check_debug = check_contain_with_debug(
+    addr_check = check_contain(
         session,
         member.get("member_id", ""),
         selected_address,
@@ -2052,38 +1656,29 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         token,
         clean_type_id,
     )
-    detail_log("📍 查詢地區 request/response", addr_check_debug)
-    detail_log("check_contain raw", addr_check)
+    if not addr_check:
+        raise Exception(f"查詢地址/地區失敗：{selected_address}")
 
-    if not isinstance(addr_check, dict):
-        raise Exception(
-            f"查詢地區失敗：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，"
-            f"原因={addr_check_debug.get('decision')}，HTTP={addr_check_debug.get('http_status')}"
-        )
-    if str(addr_check.get("return_code", "")) != "0000":
-        raise Exception(
-            f"查詢地區失敗：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，"
-            f"return_code={addr_check.get('return_code')}，description={addr_check.get('description')}，"
-            f"HTTP={addr_check_debug.get('http_status')}"
-        )
+    # 確認是否真的有模擬按下「查詢地址」
+    print("[DEBUG] check_contain raw =", addr_check)
+    try:
+        if st is not None:
+            st.write("check_contain raw =", addr_check)
+    except Exception:
+        pass
 
     area_info = addr_check.get("area") if isinstance(addr_check.get("area"), dict) else {}
     purchase_info = addr_check.get("purchase") if isinstance(addr_check.get("purchase"), dict) else {}
-    if not area_info:
-        raise Exception(
-            f"查詢地區成功但沒有 area：{selected_address}，lat={best_addr.get('lat')}，lng={best_addr.get('lng')}，"
-            f"decision={addr_check_debug.get('decision')}，raw={addr_check}"
-        )
 
     if area_info:
         best_addr["area_id"] = area_info.get("area_id", best_addr.get("area_id"))
         best_addr["company_id"] = area_info.get("company_id", best_addr.get("company_id"))
         best_addr["country_id"] = area_info.get("country_id", best_addr.get("country_id"))
 
-    # 注意：purchase_info 是查詢地區回傳的付款/發票資訊，不是下拉地址 purchase。
-    # 不覆蓋 best_addr["purchase"]，避免把下拉地址的客服備註與服務資料洗掉。
+    if purchase_info:
+        best_addr["purchase"] = purchase_info
 
-    # 模擬後台「查詢地區」後的資料補齊：
+    # 模擬後台「查詢地址」後的資料補齊：
     # 車馬費可能在 purchase、area 或巢狀欄位中，需全部掃描。
     fare_from_check = first_nonzero(
         purchase_info.get("fare") if purchase_info else "",
@@ -2103,22 +1698,14 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     # 這裡只接受 check_contain 的 purchase / 該地址 address_info 回傳值，
     # 不使用 area_info.notice，也不使用 member_payload.lastPurchase.notice，
     # 避免抓到區域備註、會員其他地址或最後一筆訂單的備註。
-    notice_from_address = (
-        best_addr.get("notice", "")
-        or extract_address_notice_from_obj({
-            "address": best_addr.get("raw_address", {}),
-            "purchase": best_addr.get("purchase", {}),
-        })
+    notice_from_check = (
+        (purchase_info.get("notice") if purchase_info else "")
+        or (purchase_info.get("service_notice") if purchase_info else "")
+        or find_nested_value(purchase_info, ["notice", "service_notice", "memo_notice", "customer_service_notice"])
+        or best_addr.get("notice", "")
         or ""
     )
-    best_addr["notice"] = notice_from_address
-    detail_log("📝 selected address notice", {
-        "addressId": best_addr.get("addressId"),
-        "notice_len": len(str(notice_from_address or "")),
-        "raw_address_keys": best_addr.get("raw_address_keys", []),
-        "address_purchase_keys": best_addr.get("address_purchase_keys", []),
-        "check_contain_purchase_keys": flatten_keys(purchase_info)[:80],
-    })
+    best_addr["notice"] = notice_from_check
 
     base_data = prepare_base_order_data(
         row0,
@@ -2177,7 +1764,12 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
         if not calc_result:
             raise Exception(f"計算時數失敗：{date_s}")
 
-        detail_log("🟠 calculate_hour raw", calc_result)
+        print("[DEBUG] calculate_hour raw =", calc_result)
+        try:
+            if st is not None:
+                st.write("🟠 calculate_hour raw =", calc_result)
+        except Exception:
+            pass
 
         calc_fields = extract_calc_fields(
             calc_result,
@@ -2185,34 +1777,23 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             fallback_fare=best_addr.get("fare", "0"),
         )
 
-        expected_total, unit_price = calc_expected_service_total(date_s, people, hours)
-        expected_price = calc_pre_tax_price_from_tax_total(expected_total)
-
-        calc_fields["sheet_expected_total"] = str(expected_total)
-        calc_fields["sheet_unit_price"] = str(unit_price)
-        calc_fields["sheet_expected_price"] = str(expected_price)
-        calc_fields["balance_rule"] = "儲值金 + 購物金 >= Google Sheet 規則含稅服務總額；車馬費不列入"
-        calc_fields["calculate_hour_tax_total_note"] = (
-            "僅供 debug。若後台 calculate_hour 回傳與 Sheet 規則不同，"
-            "扣款判斷與送單 price 以 Sheet 規則為準。"
-        )
-
         payload = base_data.copy()
         payload["date_s"] = date_s
         payload["hour"] = str(base_data.get("hour") or calc_fields.get("hour") or "")
         payload["person"] = str(base_data.get("person") or payload.get("person") or "")
-        payload["price"] = str(expected_price or calc_fields.get("price") or "0")
+        payload["price"] = str(calc_fields.get("price") or "0")
         payload["price_vvip"] = str(calc_fields.get("price_vvip") or "0")
 
-        detail_log("🟣 calc_fields", calc_fields)
+        print("[DEBUG] calc_fields =", calc_fields)
+        try:
+            if st is not None:
+                st.write("🟣 calc_fields =", calc_fields)
+        except Exception:
+            pass
         payload["fare"] = first_nonzero(calc_fields.get("fare"), best_addr.get("fare"), base_data.get("fare"), default="0")
-        payload["_required_balance_amount"] = str(expected_total)
-        payload["_backend_required_balance_amount"] = str(calc_fields.get("required_amount") or calc_fields.get("tax_total") or calc_fields.get("tax_price") or calc_fields.get("price") or "0")
 
         if str(payload.get("price", "")).strip() in ("", "0", "0.0"):
-            raise Exception(f"計算服務費後 price 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
-        if str(payload.get("_required_balance_amount", "")).strip() in ("", "0", "0.0"):
-            raise Exception(f"Sheet 規則服務總額仍為 0，請貼 👥 parsed person/hour 與 🟣 calc_fields：{date_s}")
+            raise Exception(f"計算時數後 price 仍為 0，請貼 🟠 calculate_hour raw 與 🟣 calc_fields：{date_s}")
 
         payload["notice"] = str(base_data.get("notice") or best_addr.get("notice") or "")
         payload["area_id"] = str(base_data.get("area_id") or best_addr.get("area_id") or "")
@@ -2223,31 +1804,38 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     row_details = []
     for row_num, row in rows_with_idx:
         date_s = get_date_str(row["日期"])
-        set_execution_detail_context(row_num, str(row.get("姓名", "")).strip(), date_s)
         priced_payload = build_priced_payload_for_date(date_s)
-        required_amount = parse_money_value(priced_payload.get("_required_balance_amount"), default=0)
 
         row_details.append({
             "row_num": row_num,
             "date": date_s,
             "slot": f"{date_s}_{system_period}",
-            "price": required_amount,  # 用 Sheet 規則含稅服務總額比對儲值金+購物金；車馬費不列入
+            "price": int(float(priced_payload.get("price") or 0)),  # 只拿服務費比對儲值金
             "display_period": system_display_period,
             "row": row,
             "payload": priced_payload,
         })
 
-        detail_log("🧭 row slot", {
+        print("[DEBUG] row slot =", {
             "row_num": row_num,
             "sheet_time": normalize_period_text(row["開始時間"], row["結束時間"]),
             "system_period": system_period,
             "slot": f"{date_s}_{system_period}",
             "price": priced_payload.get("price"),
-            "sheet_required_amount": priced_payload.get("_required_balance_amount"),
-            "backend_calculate_hour_required_amount": priced_payload.get("_backend_required_balance_amount"),
             "fare": priced_payload.get("fare"),
-            "balance_rule": "儲值金 + 購物金 >= sheet_required_amount；車馬費不列入",
         })
+        try:
+            if st is not None:
+                st.write("🧭 row slot =", {
+                    "row_num": row_num,
+                    "sheet_time": normalize_period_text(row["開始時間"], row["結束時間"]),
+                    "system_period": system_period,
+                    "slot": f"{date_s}_{system_period}",
+                    "price": priced_payload.get("price"),
+                    "fare": priced_payload.get("fare"),
+                })
+        except Exception:
+            pass
 
     need_create_order = has_action(selected_actions, "建單")
     row_results = {}
@@ -2294,19 +1882,28 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
     valid_details = []
 
     for detail in row_details:
-        set_execution_detail_context(detail["row_num"], str(detail["row"].get("姓名", "")).strip(), detail["date"])
         raw = get_section_raw(session, detail["payload"], token, detail["slot"])
         slot_ok = slot_exists_in_section_response(raw, detail["slot"])
         cleaners = extract_cleaners_from_section_response(raw, detail["slot"])
         detail["section_cleaners"] = cleaners
         detail["section_staff"] = format_staff_from_cleaners(cleaners, people=people)
 
-        detail_log("🧩 section match", {
+        print("[DEBUG] section match =", {
             "slot": detail["slot"],
             "matched": slot_ok,
             "staff": detail.get("section_staff"),
             "raw_preview": str(raw)[:500],
         })
+        try:
+            if st is not None:
+                st.write("🧩 section match =", {
+                    "slot": detail["slot"],
+                    "matched": slot_ok,
+                    "staff": detail.get("section_staff"),
+                    "raw_preview": str(raw)[:500],
+                })
+        except Exception:
+            pass
 
         if slot_ok:
             valid_details.append(detail)
@@ -2333,7 +1930,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
     valid_slots_for_balance = [x["slot"] for x in valid_details]
     valid_prices_for_balance = [x["price"] for x in valid_details]
-    send_slots, _, _ = filter_dates_by_balance(valid_slots_for_balance, valid_prices_for_balance, available_balance)
+    send_slots, _, _ = filter_dates_by_balance(valid_slots_for_balance, valid_prices_for_balance, stored_value)
 
     insufficient_dates = []
     send_details = []
@@ -2345,7 +1942,6 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             insufficient_dates.append(detail["date"])
 
     for detail in row_details:
-        set_execution_detail_context(detail["row_num"], str(detail["row"].get("姓名", "")).strip(), detail["date"])
         sms_time, customer_note = build_time_fields()
         service_notice = str(detail["payload"].get("notice") or "")
 
@@ -2381,17 +1977,14 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
 
     # 每筆單獨送出，避免日期互相污染
     for detail in send_details:
-        set_execution_detail_context(detail["row_num"], str(detail["row"].get("姓名", "")).strip(), detail["date"])
         payload = detail["payload"].copy()
         slots = [detail["slot"]]
 
-        detail_log("📦 booking payload",
+        print("[DEBUG] booking payload =",
               {
                   "date": detail["date"],
                   "slot": detail["slot"],
                   "price": payload.get("price"),
-                  "sheet_required_amount": payload.get("_required_balance_amount"),
-                  "backend_calculate_hour_required_amount": payload.get("_backend_required_balance_amount"),
                   "fare": payload.get("fare"),
                   "addressId": payload.get("addressId"),
                   "area_id": payload.get("area_id"),
@@ -2607,8 +2200,6 @@ def run_process_web(env_name, region, backend_email, backend_password, sheet_nam
     GET_SECTION_URL = f"{BASE_URL}/ajax/get_section"
     MAIL_SUCCESS_URL = f"{BASE_URL}/purchase/mail_success/{{order_no}}"
 
-    reset_execution_detail_log()
-
     logger(f"目前環境：{env_name}")
     logger(f"BASE_URL：{BASE_URL}")
     logger(f"執行區域：{region}")
@@ -2689,9 +2280,6 @@ def run_process_web(env_name, region, backend_email, backend_password, sheet_nam
     all_row_results = {}
     failed_records = []
 
-    total_groups = len(grouped_orders) + len(existing_order_rows)
-    logger(f"本次共 {total_groups} 組/筆待處理")
-
     for row_num, row in existing_order_rows:
         try:
             result = process_existing_order_only(row, gcal_service, region, session, selected_actions)
@@ -2719,9 +2307,7 @@ def run_process_web(env_name, region, backend_email, backend_password, sheet_nam
 
     for group_no, (_, rows_with_idx) in enumerate(grouped_orders.items(), start=1):
         _, first_row = rows_with_idx[0]
-        date_preview = ", ".join(get_date_str(r["日期"]) for _, r in rows_with_idx[:3])
-        more = "..." if len(rows_with_idx) > 3 else ""
-        logger(f"處理第 {group_no}/{len(grouped_orders)} 組：{first_row['姓名']}，共 {len(rows_with_idx)} 筆（{date_preview}{more}）")
+        logger(f"處理第 {group_no} 組：{first_row['姓名']}，共 {len(rows_with_idx)} 筆")
 
         try:
             token = get_csrf_token(session)
@@ -2760,9 +2346,6 @@ def run_process_web(env_name, region, backend_email, backend_password, sheet_nam
 
     success_count = sum(1 for v in all_row_results.values() if v.get("結果") == "成功")
     fail_count = sum(1 for v in all_row_results.values() if v.get("結果") == "失敗")
-
-    logger(f"執行摘要：成功 {success_count} 筆｜失敗 {fail_count} 筆｜總處理 {len(all_row_results)} 筆")
-    render_execution_detail_log()
 
     return {
         "success": True,
