@@ -316,10 +316,17 @@ st.markdown("<hr>", unsafe_allow_html=True)
 # ── 執行項目 ──────────────────────────────────────────────
 step("3", "執行項目")
 
+# 根據環境決定預設執行項目
+default_actions = (
+    ["建單", "寄確認信", "改 Google 日曆"]
+    if env == "prod"
+    else ["建單"]
+)
+
 selected_actions = st.multiselect(
     "執行項目",
     options=["建單", "寄確認信", "改 Google 日曆"],
-    default=["建單", "寄確認信", "改 Google 日曆"],
+    default=default_actions,
     label_visibility="collapsed",
 )
 
