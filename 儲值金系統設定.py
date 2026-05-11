@@ -1937,7 +1937,7 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             )
         return row_results
 
-    # 不再預設檢查「儲值金餘額是否足夠訂單金額」。
+   # 不再預設檢查「儲值金餘額是否足夠訂單金額」。
    # 後台系統本身已有檢查，這裡只要有班表就送出。
    insufficient_dates = []
    send_details = valid_details
