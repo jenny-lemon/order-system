@@ -195,11 +195,12 @@ html, body, [class*="css"] {
 
 [data-testid="stCode"] {
     font-size: 13px !important;
-    border-radius: 0 0 12px 12px !important;
-    max-height: 300px;
-    overflow-y: auto;
+    min-height: 420px !important;
+    max-height: 520px !important;
+    overflow-y: auto !important;
     background: #1C1C1E !important;
     margin: 0 !important;
+    white-space: pre-wrap !important;
 }
 
 /* Metrics */
