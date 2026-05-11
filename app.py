@@ -42,8 +42,6 @@ html, body, [class*="css"] {
     max-width: 1180px !important;
 }
 
-/* Hero */
-
 .hero {
     background: linear-gradient(135deg, #FFFDF0 0%, #FFFBEA 100%);
     border: 1.5px solid var(--lemon-mid);
@@ -75,8 +73,6 @@ html, body, [class*="css"] {
     margin-top: 0.3rem;
     opacity: 0.78;
 }
-
-/* Step */
 
 .step-pill {
     display: inline-flex;
@@ -123,8 +119,6 @@ html, body, [class*="css"] {
     margin-top: 0.6rem;
 }
 
-/* Labels */
-
 [data-testid="stTextInput"] label,
 [data-testid="stNumberInput"] label,
 [data-testid="stSelectbox"] label,
@@ -133,8 +127,6 @@ html, body, [class*="css"] {
     color: var(--ink) !important;
     font-weight: 700 !important;
 }
-
-/* Inputs */
 
 [data-testid="stTextInput"] input,
 [data-testid="stNumberInput"] input,
@@ -150,8 +142,6 @@ html, body, [class*="css"] {
     border-color: var(--lemon-dark) !important;
     box-shadow: 0 0 0 2px rgba(245,197,24,0.22) !important;
 }
-
-/* Buttons */
 
 [data-testid="stButton"] > button {
     background: var(--lemon) !important;
@@ -174,8 +164,6 @@ html, body, [class*="css"] {
     color: #777 !important;
 }
 
-/* Expander */
-
 [data-testid="stExpander"] {
     border: 1px solid #ececec !important;
     border-radius: 14px !important;
@@ -191,19 +179,17 @@ html, body, [class*="css"] {
     padding: 12px 16px !important;
 }
 
-/* Code */
-
+/* 執行過程拉高 + 保留換行 */
 [data-testid="stCode"] {
     font-size: 13px !important;
+    border-radius: 0 0 12px 12px !important;
     min-height: 420px !important;
-    max-height: 520px !important;
+    max-height: 560px !important;
     overflow-y: auto !important;
     background: #1C1C1E !important;
     margin: 0 !important;
     white-space: pre-wrap !important;
 }
-
-/* Metrics */
 
 [data-testid="stMetric"] {
     background: white !important;
@@ -240,10 +226,6 @@ hr {
 """, unsafe_allow_html=True)
 
 
-def sec(title):
-    st.markdown(f'<p class="sec-label">{title}</p>', unsafe_allow_html=True)
-
-
 def step(num, title):
     st.markdown(
         f'<div class="step-pill"><span class="step-num">{num}</span>{title}</div>',
@@ -254,25 +236,47 @@ def step(num, title):
 def parse_row_input(row_text: str):
     if not row_text or not row_text.strip():
         raise ValueError("請輸入列號，例如：2,3,5-7")
+
     rows = set()
+
     for part in [p.strip() for p in row_text.split(",") if p.strip()]:
         if "-" in part:
             s, e = part.split("-", 1)
             s, e = int(s.strip()), int(e.strip())
+
             if s <= 0 or e <= 0:
                 raise ValueError("列號必須大於 0")
             if s > e:
                 raise ValueError(f"區間錯誤：{part}")
+
             rows.update(range(s, e + 1))
         else:
             n = int(part)
             if n <= 0:
                 raise ValueError("列號必須大於 0")
             rows.add(n)
+
     return sorted(rows)
 
 
-# ── 標題 ─────────────────────────────────────────────────
+def format_log_message(msg):
+    text = str(msg)
+
+    text = text.replace("\\n", "\n")
+    text = text.replace("目前環境：", "\n目前環境：")
+    text = text.replace("BASE_URL：", "\nBASE_URL：")
+    text = text.replace("執行區域：", "\n執行區域：")
+    text = text.replace("執行工作表：", "\n執行工作表：")
+    text = text.replace("執行列範圍：", "\n執行列範圍：")
+    text = text.replace("處理第", "\n處理第")
+    text = text.replace("已回填 Google Sheet。", "\n已回填 Google Sheet。")
+
+    if text.startswith("▶"):
+        text = "\n" + text
+
+    return text.strip()
+
+
 st.markdown("""
 <div class="hero">
   <div class="hero-emoji">💰</div>
@@ -283,7 +287,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── 帳密 + 環境 ─────────────────────────────────────────
 step("1", "登入與環境設定")
 
 col_e, col_p, col_env = st.columns([3.2, 3.2, 1.2])
@@ -296,7 +299,6 @@ with col_env:
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
-# ── 執行設定 ──────────────────────────────────────────────
 step("2", "執行設定")
 
 c1, c2, c3 = st.columns(3)
@@ -314,10 +316,8 @@ st.markdown(
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
-# ── 執行項目 ──────────────────────────────────────────────
 step("3", "執行項目")
 
-# 根據環境決定預設執行項目
 default_actions = (
     ["建單", "寄確認信", "改 Google 日曆"]
     if env == "prod"
@@ -338,18 +338,14 @@ st.markdown(
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
-# ── 執行按鈕 ──────────────────────────────────────────────
 run_clicked = st.button("🚀  開始執行", use_container_width=True)
 
-# ── 執行過程 ──────────────────────────────────────────────
 with st.expander("📄  執行過程", expanded=True):
     log_box = st.empty()
     log_box.code("尚未執行")
 
-# ── 執行結果 ──────────────────────────────────────────────
 result_container = st.container()
 
-# ── 執行邏輯 ─────────────────────────────────────────────
 if run_clicked:
     if not backend_email.strip():
         st.error("請輸入後台帳號")
@@ -373,20 +369,18 @@ if run_clicked:
     logs = []
 
     def ui_log(msg):
-        text = str(msg)
-        text = text.replace("\\n", "\n")
-        text = text.replace("，", "，\n")
-        text = text.replace(" | ", "\n")
-        logs.append(text)
-
-        display_text = "\n\n".join(logs[-80:])
+        logs.append(format_log_message(msg))
+        display_text = "\n\n".join(logs[-120:])
         log_box.code(display_text)
 
-    total_success = total_fail = total_processed = 0
+    total_success = 0
+    total_fail = 0
+    total_processed = 0
 
     with st.spinner("執行中，請稍候…"):
         for row_no in target_rows:
             ui_log(f"▶ 開始執行第 {row_no} 列…")
+
             try:
                 result = run_process_web(
                     env_name=env,
@@ -399,10 +393,12 @@ if run_clicked:
                     selected_actions=selected_actions,
                     logger=ui_log,
                 )
+
                 if isinstance(result, dict):
                     total_success += result.get("success_count", 0)
                     total_fail += result.get("fail_count", 0)
                     total_processed += result.get("total_processed", 0)
+
             except Exception as e:
                 total_fail += 1
                 ui_log(f"❌ 第 {row_no} 列失敗：{e}")
