@@ -1937,18 +1937,10 @@ def process_one_group(session, rows_with_idx, token, gcal_service, region, backe
             )
         return row_results
 
-    valid_slots_for_balance = [x["slot"] for x in valid_details]
-    valid_prices_for_balance = [x["price"] for x in valid_details]
-    send_slots, _, _ = filter_dates_by_balance(valid_slots_for_balance, valid_prices_for_balance, stored_value)
-
-    insufficient_dates = []
-    send_details = []
-
-    for detail in valid_details:
-        if detail["slot"] in send_slots:
-            send_details.append(detail)
-        else:
-            insufficient_dates.append(detail["date"])
+    # 不再預設檢查「儲值金餘額是否足夠訂單金額」。
+   # 後台系統本身已有檢查，這裡只要有班表就送出。
+   insufficient_dates = []
+   send_details = valid_details
 
     for detail in row_details:
         sms_time, customer_note = build_time_fields()
