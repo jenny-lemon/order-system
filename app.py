@@ -373,8 +373,14 @@ if run_clicked:
     logs = []
 
     def ui_log(msg):
-        logs.append(str(msg))
-        log_box.code("\\n".join(logs[-80:]))
+        text = str(msg)
+        text = text.replace("\\n", "\n")
+        text = text.replace("，", "，\n")
+        text = text.replace(" | ", "\n")
+        logs.append(text)
+
+        display_text = "\n\n".join(logs[-80:])
+        log_box.code(display_text)
 
     total_success = total_fail = total_processed = 0
 
