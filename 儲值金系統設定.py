@@ -1123,13 +1123,26 @@ def _extract_staff_line(lines):
     normalized = normalize_text_for_parse(joined)
 
     # 支援任意人數的服務人員，例如：
+    # 陳靜怡(3)X蔡宗原(5)X鄭蓓婷(1)
     # 余世煒(3)X黃惟芊(2)X檸檬人1(0)
-    m = re.search(
-        r'((?:[\u4e00-\u9fffA-Za-z0-9]+\(\d+\))(?:X[\u4e00-\u9fffA-Za-z0-9]+\(\d+\))*)',
-        normalized,
-    )
-    if m:
-        return normalize_staff_display(m.group(1))
+    #
+    # 舊寫法只抓到前兩個 group，因此 3 人以上會少顯示。
+    # 這裡改成先找「連續 X 串接的人員群組」，並取人數最多的那一組。
+    staff_token = r"[\u4e00-\u9fffA-Za-z0-9]+[（(]\d+[）)]"
+    staff_group_pattern = rf"{staff_token}(?:[Xx×]{staff_token})+"
+
+    groups = re.findall(staff_group_pattern, normalized)
+    if groups:
+        best_group = max(
+            groups,
+            key=lambda value: len(re.findall(staff_token, value)),
+        )
+        return normalize_staff_display(best_group)
+
+    # 支援只有 1 位服務人員的訂單，例如：檸檬人1(0)
+    singles = re.findall(staff_token, normalized)
+    if singles:
+        return normalize_staff_display(singles[0])
 
     return "無人力"
 
