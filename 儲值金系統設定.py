@@ -1122,18 +1122,14 @@ def _extract_staff_line(lines):
     joined = "\n".join(lines)
     normalized = normalize_text_for_parse(joined)
 
-    m = re.search(r'([\u4e00-\u9fffA-Za-z0-9]+\(\d+\))X([\u4e00-\u9fffA-Za-z0-9]+\(\d+\))', normalized)
+    # 支援任意人數的服務人員，例如：
+    # 余世煒(3)X黃惟芊(2)X檸檬人1(0)
+    m = re.search(
+        r'((?:[\u4e00-\u9fffA-Za-z0-9]+\(\d+\))(?:X[\u4e00-\u9fffA-Za-z0-9]+\(\d+\))*)',
+        normalized,
+    )
     if m:
-        return normalize_staff_display([m.group(1), m.group(2)])
-
-    for i, line in enumerate(lines):
-        t = normalize_text_for_parse(line)
-        if re.search(r'\(\d+\)X$', t):
-            first = re.sub(r'X$', '', t)
-            if i + 1 < len(lines):
-                second = normalize_text_for_parse(lines[i + 1])
-                if re.search(r'\(\d+\)$', second):
-                    return normalize_staff_display([first, second])
+        return normalize_staff_display(m.group(1))
 
     return "無人力"
 
